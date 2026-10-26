@@ -42,13 +42,13 @@ generated files so the defaults are applied again.
 | BOOT button | Action |
 |---|---|
 | short press | respawn the sand at the top |
-| long press (0.7 s) | next look: green gravel → orange gravel → green water → orange water → … |
+| long press (0.7 s) | next look: green gravel → orange gravel → green liquid → orange liquid → … |
 
 Switching looks keeps every grain where it is and only changes colour and
-behaviour: a sand pile slumps flat as water, water switched to sand stays
+behaviour: a sand pile slumps flat as liquid, liquid switched to sand stays
 put and piles at the angle of repose on the next tilt. The serial log shows
-the new mode name (`mode: green water (palette green, material water)`), and
-the screen briefly shows the material name (GRAVEL / WATER) in the new
+the new mode name (`mode: green liquid (palette green, material liquid)`), and
+the screen briefly shows the material name (GRAVEL / LIQUID) in the new
 colour: full strength for 0.6 s, then fading out over 0.4 s
 (`OVERLAY_HOLD_MS`, `OVERLAY_FADE_MS`, `OVERLAY_SCALE` in `config.h`). It is
 also shown once at boot.
@@ -112,8 +112,8 @@ The first entry is the look at boot.
 #define SAND_MODE_TABLE {                                  \
     { "green gravel", PALETTE_GREEN, MATERIAL_CLASSIC },   \
     { "orange gravel", PALETTE_ORANGE, MATERIAL_CLASSIC }, \
-    { "green water", PALETTE_GREEN, MATERIAL_WATER },      \
-    { "orange water", PALETTE_ORANGE, MATERIAL_WATER },    \
+    { "green liquid", PALETTE_GREEN, MATERIAL_LIQUID },    \
+    { "orange liquid", PALETTE_ORANGE, MATERIAL_LIQUID },  \
 }
 ```
 
@@ -121,19 +121,30 @@ Palettes (`PALETTE_GREEN`, `PALETTE_ORANGE`; 4 shades each plus the LED
 colour) are in `src/palette.c`. `PALETTE_DEFAULT` only sets the tiltdot colour.
 
 Materials are `material_t` structs in `config.h` (`MATERIAL_CLASSIC_PARAMS`,
-`MATERIAL_WATER_PARAMS`), one engine with per-material parameters:
+`MATERIAL_LIQUID_PARAMS`), one engine with per-material parameters:
 
 | Field | Effect |
 |---|---|
-| `rest_rule` | `MAT_REST_REPOSE` (sand piles at an angle) or `MAT_REST_SPREAD` (water levels) |
+| `rest_rule` | `MAT_REST_REPOSE` (sand piles at an angle) or `MAT_REST_SPREAD` (liquid levels) |
 | `repose_angle_deg`, `rule_prob` | steepest stable pile slope; how eagerly resting grains act |
 | `gravity_scale`, `max_speed`, `damping` | how fast grains fall and flow |
 | `elasticity`, `contact_friction` | bounce on impact, skid along the pile |
 | `glass_friction` | friction against the glass × \|gz\|: slows grains when leaned back, freezes them near flat |
 | `repose_dither` | randomness so pile angles aren't stuck on grid slopes |
-| `spread_scan`, `spread_push` | water: how far a surface grain looks for a lower spot, how hard it is pushed there |
-| `level_rate`, `level_range` | water: how fast the surface levels after a big tilt |
-| `shade_spread` | shade variation: 1 = full palette texture (sand), lower = smoother (water) |
+| `spread_scan`, `spread_push` | liquid: how far a surface grain looks for a lower spot, how hard it is pushed there |
+| `viscosity` | liquid: how strongly moving grains share momentum with their neighbours (0 = loose grains; 0.15 = slightly viscous, moves and falls as a body) |
+| `wave_gain`, `wave_damping`, `wave_start` | liquid sloshing: how hard the surface is pulled back to level, how fast the waves die out (0.04 ≈ one gentle overshoot), how big a tilt starts them |
+| `level_rate` | liquid: flow cap per column pair for the waves (grains/step) |
+| `impact_absorb` | liquid landings: how strongly a landing grain takes on the velocity of the liquid around it (0.8: a pour joins the local flow, no bounce or splash) |
+| `impact_to_flow` | liquid landings: extra sideways flow from the landing speed (0 = off; never faster than the landing) |
+| `knock_splash`, `knock_fan_deg` | liquid knock: launch speed of thrown grains per unit of shake; spread of their launch directions (± degrees around up, leaning with the knock) |
+| `knock_depth`, `knock_max`, `knock_interior` | liquid knock: how many grains from the top of each column can be thrown (1–2); most grains thrown per knock; sideways push on the rest of the body |
+| `shade_spread` | shade variation: 1 = full palette texture (sand), lower = smoother (liquid) |
+
+The knock is the liquid's only splash. Falling or poured liquid never
+splashes: it is absorbed where it lands. Grains thrown by a knock are
+*spray*: they land without any reaction, so a knock gives one splash that
+falls back and settles.
 
 **`MATERIAL_CLASSIC_PARAMS` ("gravel" on screen) is the sand confirmed on
 hardware ("Classic physics v1" in `docs/SPEC.md`), verified bit for bit by
@@ -164,16 +175,28 @@ All in `config.h`, each commented:
 
 ### Testing the simulation on a PC
 
-`sim.c` and `material.c` have no ESP-IDF dependencies. Four host tools:
+`sim.c` and `material.c` have no ESP-IDF dependencies. Host tools:
+
+Builds go to `build-host/` (git-ignored):
 
 ```sh
+mkdir -p build-host
 B="cc -std=c11 -O2 -Wall -Wextra -Isrc src/sim.c src/material.c"
-$B tools/sim_golden.c -lm -o sim_golden && ./sim_golden   # CLASSIC == Classic physics v1, bit for bit
-$B tools/sim_host.c   -lm -o sim_host   && ./sim_host     # sand: pile angles, lean, flat, tip, shake
-$B tools/sim_water.c  -lm -o sim_water  && ./sim_water    # water levelling, material switching, tremor/wake
-$B tools/sim_bench.c  -lm -o sim_bench  && ./sim_bench    # µs per step, both materials, 7 scenarios
-$B tools/sim_hand.c   -lm -o sim_hand   && ./sim_hand     # held in hand: awake grains and cost over 20 s
+$B tools/sim_golden.c   -lm -o build-host/sim_golden   && build-host/sim_golden   # CLASSIC == Classic physics v1, bit for bit
+$B tools/sim_host.c     -lm -o build-host/sim_host     && build-host/sim_host     # sand: pile angles, lean, flat, tip, shake
+$B tools/sim_liquid.c   -lm -o build-host/sim_liquid   && build-host/sim_liquid   # liquid levelling, material switching, tremor/wake
+$B tools/sim_bench.c    -lm -o build-host/sim_bench    && build-host/sim_bench    # µs per step, both materials, 7 scenarios
+$B tools/sim_hand.c     -lm -o build-host/sim_hand     && build-host/sim_hand     # held in hand: awake grains and cost over 20 s
+$B tools/sim_liquidfx.c -lm -o build-host/sim_liquidfx && build-host/sim_liquidfx # liquid: drops, pours, sloshing, knock, flip
+$B tools/sim_liquidstab.c -lm -o build-host/sim_liquidstab && build-host/sim_liquidstab # liquid always comes to rest: knock repro, 20 x 60 s random input
 ```
+
+`sim_liquidfx`, `sim_liquidstab`, `sim_liquid`, `sim_bench` and `sim_hand` take liquid
+parameter overrides as `name=value`, for any numeric `material_t` field
+(`tools/overrides.h`), e.g. `build-host/sim_liquidfx wave_damping=0.02 viscosity=0.3`.
+Each run prints the overrides it applied; an unknown name stops with an error
+listing the valid ones. They only change the host run: to change the
+firmware, edit `MATERIAL_LIQUID_PARAMS` in `config.h`.
 
 ## Serial output
 
@@ -203,5 +226,5 @@ per-grain code avoids them entirely (see `docs/SPEC.md` §5, §10). To compare
 step cost on a PC:
 
 ```sh
-cc -std=c11 -O2 -Isrc src/sim.c src/material.c tools/sim_bench.c -lm -o sim_bench && ./sim_bench
+mkdir -p build-host && cc -std=c11 -O2 -Isrc src/sim.c src/material.c tools/sim_bench.c -lm -o build-host/sim_bench && build-host/sim_bench
 ```

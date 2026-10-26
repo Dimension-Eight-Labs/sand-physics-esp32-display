@@ -12,7 +12,7 @@ the code; deviations from the original brief are listed in §11.
 
 - About one third of the screen is filled with glowing monochrome sand grains.
 - Tilting the board makes sand flow, pile and slide; piles settle at a
-  sand-like angle of repose (~30–35°), not flat like water.
+  sand-like angle of repose (~30–35°), not flat like liquid.
 - Shaking the board splashes the sand; it then resettles.
 - Board lying flat: sand stays put with minimal drift.
 - Mostly needs to look cool.
@@ -61,7 +61,7 @@ All values live in `src/board.h`, each with a citation. Sources:
 src/
   board.h        pins + panel constants, each with source citation
   config.h       every tunable: app mode, material structs, look table, grain size, look
-  sim.[ch]       grid + grains + step function, both resting rules, water levelling (NO ESP-IDF headers)
+  sim.[ch]       grid + grains + step function, both resting rules, liquid levelling (NO ESP-IDF headers)
   material.[ch]  material table lookup                   (NO ESP-IDF headers)
   palette.[ch]   phosphor palettes + RGB565 LUT  (NO ESP-IDF headers)
   render.[ch]    glow/persistence buffer, frame composition (NO ESP-IDF headers)
@@ -73,8 +73,11 @@ src/
 tools/
   sim_golden.c   PC test: CLASSIC reproduces Classic physics v1 bit for bit
   sim_host.c     PC harness: repose angles, tilt/lean/flat behaviour, shake recovery (classic)
-  sim_water.c    PC harness: water levelling, material switching, tremor / wake
+  sim_liquid.c    PC harness: liquid levelling, material switching, tremor / wake
   sim_hand.c     PC harness: pool / pile held in hand (tremor, sway, lean wobble): awake + cost
+  sim_liquidfx.c  PC harness: liquid drops on a pool, continuous pours, free fall, sloshing, knock, flip, heap slump
+  sim_liquidstab.c PC harness: liquid comes to rest on its own (knock repro, 60 s random input)
+  overrides.h     name=value material overrides shared by the host tools
   sim_bench.c    PC benchmark: µs per step per material, six scenarios
 ```
 
@@ -358,13 +361,13 @@ the golden scenarios wake under both rules, so they still match bit for bit.
 ## 5b. Materials
 
 All per-material physics is a `material_t` in `config.h`
-(`MATERIAL_CLASSIC_PARAMS`, `MATERIAL_WATER_PARAMS`); `material.c` holds the
+(`MATERIAL_CLASSIC_PARAMS`, `MATERIAL_LIQUID_PARAMS`); `material.c` holds the
 table. One engine; the material's *resting rule* decides what a supported,
-slow grain does: `MAT_REST_REPOSE` (sand) or `MAT_REST_SPREAD` (water).
+slow grain does: `MAT_REST_REPOSE` (sand) or `MAT_REST_SPREAD` (liquid).
 `sim_set_material()` switches at any time: every grain stays where it is,
 all are woken and the gravity-derived terms are recomputed.
 
-| Field | CLASSIC (= v1) | WATER | Meaning |
+| Field | CLASSIC (= v1) | LIQUID | Meaning |
 |---|---|---|---|
 | `gravity_scale` | 0.06 | 0.06 | cells/step² per g |
 | `damping` | 0.01 | 0.005 | drag per step |
@@ -378,12 +381,20 @@ all are woken and the gravity-derived terms are recomputed.
 | `rest_rule` | REPOSE | SPREAD | resting behaviour |
 | `rule_prob` | 0.35 | 1.0 | × min(1, √net) per step |
 | `repose_angle_deg` / `_scan` / `_diag_correction_deg` / `_dither` | 33 / 4 / 4 / 0.15 | — | angle of repose |
-| `spread_scan` / `spread_push` / `spread_step` | — | 24 / 0.8 / 0 | look-ahead, sideways push (cells/step), jump |
-| `level_rate` / `level_range` | 0 (off) | 8 / 86 | levelling transfers per step, reach |
+| `spread_scan` / `spread_push` / `spread_step` | — | 24 / 0.4 / 0 | look-ahead, sideways push (cells/step), jump |
+| `wave_gain` / `wave_damping` | — | 0.05 / 0.04 | wave flow gained per cell of imbalance per step / lost per step |
+| `wave_window` / `wave_start` | — | whole tank / 4 cells | pressure window; imbalance that starts waves |
+| `level_rate` | 0 (off) | 3 | wave flow cap per column pair (+ ¼ of the imbalance), grains/step |
+| `level_global_rate` / `level_range` | — | 8 / 86 | quiet background levelling (only while waves are idle) |
 | `level_max_motion` | — | 400 | levelling paused while total motion is above this (splashing) |
+| `viscosity` | — | 0.15 | per step, a moving grain's velocity moves this far toward its neighbours' mean |
+| `impact_absorb` | — | 0.8 | on landing, velocity pulled this far toward the neighbours' mean |
+| `impact_to_flow` | — | 0 (off) | share of landing speed turned into sideways flow (never above the landing speed) |
+| `knock_splash` / `knock_fan_deg` | — | 1.0 / 35 | launch speed per unit of shake strength (× 0.6–1.0); launch directions ± around the splash direction |
+| `knock_depth` / `knock_max` / `knock_interior` | — | 1 / 40 / 0.1 | grains from each column top that can be thrown; most thrown per knock; sideways push on the rest |
 | `wake_radius` | 0 (= `WAKE_RADIUS` 2) | 1 | cells around a vacated cell whose sleepers wake |
 | `shade_spread` | 1.0 | 0.3 | palette shade variation |
-| `name` (overlay / logs) | "gravel" | "water" | user-facing name; internally still `MATERIAL_CLASSIC` |
+| `name` (overlay / logs) | "gravel" | "liquid" | user-facing name; internally still `MATERIAL_CLASSIC` |
 
 **CLASSIC verification** (host, x86-64 gcc -O2): `tools/sim_golden.c`
 matches all 8 v1 state hashes bit for bit, and `tools/sim_host.c` output is
@@ -392,60 +403,121 @@ On the ESP32-S3 the compiler may fuse multiply-adds differently now that the
 constants are struct fields, so the board can differ from v1 in the last
 float bit, not in behaviour.
 
-### Water model
+### Liquid model (2026-10-26, liquid round)
 
-1. Same moving step as sand, with low bounce and almost no friction on the
-   pile, so it slides and sloshes, and splashes on shake.
-2. **Spread rule** (resting surface grains): look up to `spread_scan` cells
-   along each lateral direction for a spot where the grain would end at least
-   one cell lower in *true* gravity (a drop below that spot, or gravity
-   leaning toward that side by the residual tilt φ). If found, give the grain
-   a sideways velocity of `spread_push`; it slides with momentum and rests
-   again when nothing lower is in reach.
-3. **Levelling pass** (stand-in for pressure): in a one-grain-per-cell grid
-   only the surface layer can flow, so a deep pool would take 5–10 s to level
-   after a big tilt (measured: every surface-only variant tried — pushes,
-   jumps, higher speed caps — needed 5–18 s). Each step, while any water
-   grain is awake, the grid is split into lines along gravity; up to
-   `level_rate` top grains move from the highest line to the free spot above
-   the lowest line within `level_range`, only if that lowers the grain by at
-   least half a cell (so it always converges). Heights use true gravity, so
-   tilt inside the snapped frame is honoured. Water's shades are pulled
-   together (`shade_spread` 0.3), so this reads as one side of the surface
-   dropping while the other rises.
-4. Glass friction and the frozen state work as for sand: lying flat, water
-   holds still; it freezes at ~84° lean (lower glass friction than sand's
-   ~81°).
-5. **Idle cost (2026-10-26, second round).** Water differs from gravel in
-   three places that only affect cost, not the look:
-   - A gravity change wakes only *exposed* water grains (a free cell beside,
-     above or below), not the whole pool: a fully surrounded grain cannot move
-     whatever gravity does, and wakes through its neighbours if one leaves.
-     Gravel keeps wake-all, so CLASSIC stays bit-identical.
-   - A resting water grain with both sideways cells taken skips the spread
-     look-ahead and its random draw (the whole submerged body).
-   - The levelling pass is skipped while it cannot find anything new: the
-     last pass ended level, no grain changed cell since, and gravity turned
-     less than `LEVEL_RECHECK_DEG` (0.5°). It is also paused above
-     `level_max_motion` (hard splashing), and no longer requires an awake
-     grain to run.
-   - `wake_radius` 1 instead of 2 (gravel keeps 2; radius 2 exists for the
-     repose look-ahead, which water does not have). With interior grains now
-     staying asleep, radius 2 made every moving water grain scan 25 cells.
-6. Tilts that stay inside one snapped gravity frame (< 22.5°) are re-levelled
-   by levelling transfers (~3–8 grains/step) rather than by visible spread
-   pushes; bigger tilts flow physically. Unchanged from the previous round.
+The liquid was called "water" until the liquid round (`MATERIAL_WATER`,
+`step_water()`, `tools/sim_water*.c`); everything is now named liquid, and
+the notes of earlier rounds below use the new name.
 
-### Material host results (`tools/sim_water.c`)
+Liquid has its own step (`step_liquid`, `move_liquid`, `liquid_hit`) on the
+same integration; gravel's code path is untouched (golden hashes match).
+
+1. **Support and grounding.** A grain is supported by a wall or by a grain
+   that is not falling away (moving away along gravity faster than 0.05
+   cells/step). It is *grounded* if it is supported by a wall, a grounded
+   grain or a sleeping one. **Only grounded grains rest.** When "down"
+   changes (a flip, a tilt across 22.5°) the whole body is woken and
+   `ground_sweep()` grounds, in every line along gravity, the run of grains
+   packed against the wall; anything above a gap is ungrounded and falls. So
+   a flipped pool falls as one body, while a resting pool stays at rest
+   across a frame change.
+2. **No sideways jumps in free fall.** The spread rule acts only on resting
+   (hence grounded) grains. Before, any grain with a grain under it counted
+   as supported, so grains on top of a falling body were treated as resting
+   and pushed sideways (1137 pushes in the first 0.6 s of a flip; now 0).
+3. **Falling bodies stay together.** A grain blocked by a grain moving the
+   same way keeps pace with it; blocked by an ungrounded (still falling)
+   grain it waits, keeping its speed but never more than one step of gravity
+   faster than the grain ahead. Impacts happen only on walls and grounded
+   grains. Awake liquid grains are updated farthest-along-gravity first
+   (`liquid_sweep()`: a bucket sort on the line across gravity, random start
+   and alternating direction within a line), so the grain ahead has always
+   moved before the one behind it; with the old index order every follower
+   updated before its leader lost a step and a falling body stretched into
+   streams.
+4. **Viscosity.** Each step, before gravity, a moving liquid grain's velocity
+   moves `viscosity` of the way toward the mean velocity of the grains in
+   its 4 neighbour cells (momentum sharing; resting neighbours count as
+   still). The body flows freely but moves, falls and lands as sheets and
+   blobs. There is no free-fall jitter or per-grain gravity any more.
+5. **Landing is absorbed.** A landing grain (moving with gravity faster than
+   `rest_speed` when blocked) has its velocity pulled `impact_absorb` (0.8)
+   of the way toward the mean velocity of the grains around it, after a
+   bounce of `elasticity` (0.05). It joins the local flow: a pour onto a
+   pool, a slope or a moving wave stays calm where the stream meets the
+   body. `impact_to_flow` can add sideways flow from the landing (capped at
+   the larger of the grain's existing sideways speed and `impact_to_flow` ×
+   the landing speed), but it is 0 by default. There is no impact splash:
+   the fix round removed it (a pour set it off continuously, and grains
+   thrown straight up their columns made vertical lines).
+6. **Spray.** Grains thrown by a knock are marked spray (`LIQ_SPRAY` in
+   `sim_t.ground`). When spray lands: no bounce, half its sideways speed
+   kept, no flow, and it is never thrown again until it has rested (the mark
+   clears when it is grounded and slow).
+7. **Knock splash, the only splash.** Candidates are the top `knock_depth`
+   (1) grains of each column, resting on something and not already spray.
+   At most `knock_max` (100) per knock are thrown, picked at random over the
+   whole surface; impulses less than 6 steps apart are one knock and share
+   the cap (under sustained shaking it renews every 30 steps). Each thrown
+   grain gets its own direction: the splash direction (up against gravity,
+   leaning ~20° toward the knock) ± `knock_fan_deg` (35°), never within 8°
+   of straight up its column, at `knock_splash` × strength × 0.6–1.0
+   cells/step. So a knock throws a loose fan of droplets, not lines. The
+   rest of the body gets `knock_interior` × the launch speed as a sideways
+   push along the knock.
+8. **Waves (sloshing).** A 1-D shallow-water model on the column heights
+   replaces the long-range levelling transfers for real tilts. Each pair of
+   neighbouring columns has a flow velocity `q` (grains/step) and an
+   accumulator: `q += wave_gain × drive`, `q *= 1 − wave_damping`,
+   `|q| ≤ level_rate + ¼|imbalance|`; whenever the accumulator passes a whole
+   grain, the top grain of one column moves onto its neighbour. The drive is
+   the difference between the mean heights of the pressure-carrying columns
+   on either side (`wave_window`, default the whole tank, i.e. the
+   fundamental sloshing mode) minus a one-cell dead band. Because `q` has
+   inertia the surface overshoots level and rocks back. Waves start only
+   above `wave_start` (4 cells, ≈ 5° across half the tank); smaller
+   imbalances (hand sway) are finished by the quiet background levelling at
+   `level_global_rate`. Dry columns carry no pressure, but liquid spills into
+   a dry neighbour whose floor is lower in true gravity. Since the stability
+   round the model always comes to rest:
+   - Only columns with room above their top carry pressure (a column full to
+     the grid edge can never level).
+   - A column's top skips droplets, spray not yet at rest and grains still
+     falling in (≥ `WAVE_FALLING` 0.6 cells/step along gravity) onto the body:
+     landings only add mass where they settle. A line that is falling as a
+     whole counts its first grain.
+   - Only top grains slower than 0.5 cells/step are moved, and no move lifts
+     a grain more than `WAVE_MAX_LIFT` (4) steps along gravity.
+   - A pair that cannot move (no room, too steep) loses its flow; a pair
+     whose top is still moving holds and loses a fifth per step.
+   - Once the whole surface has been inside the dead band for 0.5 s the flow
+     drains (×0.85/step); the waves end after 1 s there, or after 30 passes
+     without a move.
+   - Backstop: more than 2 s after the last input (shake, gravity wake,
+     material, spawn), if the largest imbalance has reversed ≥ 3 times and
+     the flow energy fell less than 30 % in the last second, or in any case
+     once waves still run 4 s after the input, the drive is cut and the flow
+     halved per step (`n_wave_backstop`).
+9. **Spread rule** (grounded resting surface grains): as before, a sideways
+   push (`spread_push` 0.4) toward a spot at least one cell lower in true
+   gravity within `spread_scan`.
+10. Glass friction and the frozen state work as for sand: lying flat, liquid
+   holds still; it freezes at ~84° lean.
+11. **Idle cost.** Small gravity changes wake only exposed liquid grains
+    (frame changes wake all, item 1); submerged grains skip the spread
+    look-ahead; levelling/waves are skipped while nothing can change and
+    paused above `level_max_motion`; `wake_radius` 1.
+
+### Material host results (`tools/sim_liquid.c`)
 
 | Test | Result |
 |---|---|
-| Water spawn | settles in 4.4 s, surface within 1 cell |
+| Liquid spawn | settles in 4.4 s, surface within 1 cell |
 | Tilt 0 → 45° | surface 40° at 0.75 s, 42° at 1.25 s, 43.7° (deviation 3.5 cells) from 4 s; at rest 5.9 s |
 | Back 45° → 0° | level within 2 cells at 0.85 s, within 1 cell at 1.25 s, all asleep at 1.75 s |
-| Classic heap (28-cell high) → water | within 2 cells at 0.35 s, 1 cell at 0.8 s |
-| Water pool → classic | 0 grains move, 0 awake; next rotation of 50° piles at effective repose 31.3° (sand alone 31.0°) |
-| Water lying flat, ±0.03 g noise | 0 grains moved |
+| Classic heap (28-cell high) → liquid | within 2 cells at 0.35 s, 1 cell at 0.8 s |
+| Liquid pool → classic | 0 grains move, 0 awake; next rotation of 50° piles at effective repose 31.3° (sand alone 31.0°) |
+| Liquid lying flat, ±0.03 g noise | 0 grains moved |
 | Held upright, ±0.03 g tremor (± 1° sway) | 0 of 4540 awake, both materials (v1 rule: 4540) |
 | Deliberate 5° tilt during tremor | whole pile awake within 8 steps (67 ms), both materials |
 
@@ -453,31 +525,31 @@ At 45° (a diagonal gravity frame) the levelled surface sits within ~1.9
 height units, which shows as 43.7° instead of 45° and 3.5 cells deviation
 across the width; upright it levels to 1 cell.
 
-### Water idle round (2026-10-26)
+### Liquid idle round (2026-10-26)
 
-**Hardware before:** water held in hand ~7 ms/step mean, 8.5–9 ms max,
+**Hardware before:** liquid held in hand ~7 ms/step mean, 8.5–9 ms max,
 4540 awake with motion 0–11 for long stretches; gravel held 4 ms / 6–7 ms
 (accepted as is); both 0 awake, 0.53 ms lying still. Render "fps 60 (40 new)",
 sometimes 20–30 new, with the sim at 120 steps/s. One dip to 107 steps/s in a
-hard water shake.
+hard liquid shake.
 
-**Root cause, idle water.** `tools/sim_hand.c` (lean 20°, ±0.03 g tremor,
+**Root cause, idle liquid.** `tools/sim_hand.c` (lean 20°, ±0.03 g tremor,
 ±3° + ±2° in-plane sway, ±2° lean wobble) reproduces it: the hand motion
 crosses the 2° / 0.06 g wake limits about twice per second; every crossing
 woke all 4540 grains, and they need 64 steps to fall asleep again, so on
-average ~3250 were awake (gravel the same: accepted). For water each awake
+average ~3250 were awake (gravel the same: accepted). For liquid each awake
 resting grain also ran the spread look-ahead every step (rule_prob 1.0) and
 the levelling pass rescanned the grid every step. Levelling transfers
 (50–80/s following the sway) were a small part; spread pushes were 0.
 
-**Fix:** item 5 of the water model above. Hand-held host results:
+**Fix:** the "Idle cost" item of the liquid model above. Hand-held host results:
 
 | | before | after |
 |---|---|---|
-| water, held: awake (20 s mean) | 3254 | 73 |
-| water, held: host µs/step mean | 90.5 | 12.6 |
+| liquid, held: awake (20 s mean) | 3254 | 73 |
+| liquid, held: host µs/step mean | 90.5 | 12.6 |
 | gravel, held (unchanged) | 3240 awake, 64 µs | same |
-| water, 5° tilt during tremor | — | first grains move after 4 steps (33 ms); surface only wakes (peak 160) |
+| liquid, 5° tilt during tremor | — | first grains move after 4 steps (33 ms); surface only wakes (peak 160) |
 
 **Root cause, "new" frames.** The sim published a snapshot only at the end of
 a batch of steps, and only if the renderer had taken the previous one. When
@@ -494,7 +566,7 @@ the last step before it. Model: 99–100 % new frames for 0.5–9.5 ms steps, at
 60–100 snapshot builds/s (was ≤ 60; each is a few hundred µs on the sim
 core, shown in the stats as "snapshot").
 
-**Water cost** (host µs/step mean / worst; `tools/sim_bench.c`):
+**Liquid cost** (host µs/step mean / worst; `tools/sim_bench.c`):
 
 | Scenario | previous round | now |
 |---|---|---|
@@ -507,20 +579,236 @@ core, shown in the stats as "snapshot").
 
 Board estimate. Two ratios fit the hardware data: resting/awake work is
 ~65–70× the host (0.53 ms ↔ 8 µs lying still; 8.6 ms ↔ 123 µs all-awake
-water), moving work ~14× (gravel shake worst 6–7 ms ↔ 461 µs). Water held in
+liquid), moving work ~14× (gravel shake worst 6–7 ms ↔ 461 µs). Liquid held in
 hand: ~0.9 ms/step (was ~7). All-awake bursts: ~3.5 ms (was ~8.6). Hard
 shake: mean ~3.4 ms, single worst ~6.8 ms, the same as gravel.
 
-**Water look**, previous round → now (`tools/sim_water.c`): 45° tilt surface
+**Liquid look**, previous round → now (`tools/sim_liquid.c`): 45° tilt surface
 40.1° at 0.75 s in both, 43.7°/3.5 cells final in both, at rest 5.9 s → 5.0 s;
-back to upright level in 0.85 s in both; heap → water within 2 cells at 0.35 s
-in both, final 1 → 2 cells; water → gravel then 50°: effective repose 31.3° →
+back to upright level in 0.85 s in both; heap → liquid within 2 cells at 0.35 s
+in both, final 1 → 2 cells; liquid → gravel then 50°: effective repose 31.3° →
 31.1°; lying flat 0 moved in both (145 → 2 awake); freeze point ~84° in both.
+
+### Liquid behaviour round (2026-10-26)
+
+`tools/sim_liquidfx.c` (new) measures the behaviours; the "previous" column is
+the previous round's liquid (same build with the liquid step routed back
+through the gravel step and generic shake).
+
+| Test | previous round | now |
+|---|---|---|
+| Flip: spread pushes in the first 0.6 s | 1137 | 0 |
+| Flip: falling grains' sideways speed, max | 0.81 cells/step | 0.30 |
+| Flip: grains falling at 0.1 / 0.2 s | body peeled from its leading edge | 96 % / 99 % |
+| Flip: body during the fall (53 rows deep) | — | 58 → 73 → 120 → 156 rows tall at 0.1/0.2/0.4/0.6 s, mostly sparse rows (streams) |
+| Flip: impact droplets | — | up to 72 grains thrown back, 20th highest 7 cells |
+| Flip: level after landing | 4.85 s | 3.05 s |
+| Tilt 10° and back | no overshoot, quiet re-level in 0.17 s | +8.3° → −3.5° (visible overshoot), settled 4.4 s |
+| Tilt 25° and back | no overshoot, 0.42 s | 1–3 swings past level depending on the run (e.g. +15.8° → −1.8° → +1.3° → −2.6°), settled 4–5 s |
+| Knock (1 g) | droplets 4 cells high, 2 grains airborne, down in 0.17 s | droplets up to 35 cells, 41 airborne, down in 0.9 s |
+| Gravel heap → liquid | within 2 cells in 0.35 s (teleport levelling) | spread to ±10 cells in ~0.7 s, within 2 cells in 3.1 s (wave ripples decay) |
+| 45° tilt and back (old suite) | at rest after 5.0 s | at rest after 6.7 s (sloshing and splash) |
+| Lying flat ±0.03 g noise; liquid → gravel | 0 moved; piles at 31.1° | unchanged (0; 31.2°) |
+| Held in hand (`tools/sim_hand.c`) | 73 awake, 12.6 µs | 73 awake, 14–19 µs (host noise between runs) |
+
+**Cost** (`tools/sim_bench.c`, host µs/step mean / worst, same run for both
+materials; previous-round liquid in brackets, from its own run):
+
+| Scenario | gravel | liquid now | liquid previous round |
+|---|---|---|---|
+| awake (all woken, resting) | 93.8 / 198.7 | 77.6 / 192.6 | (50.1 / 124.7) |
+| shake | 308.6 / 549.5 | 367.0 / 640.9 | (241.9 / 483.9) |
+| freefall | 239.2 / 311.2 | 326.1 / 473.0 | (248.1 / 333.5) |
+| steer (1°/step) | 159.0 / 344.6 | 311.7 / 677.8 | (189.9 / 388.7) |
+| slosh | 100.3 / 150.1 | 155.5 / 352.9 | (96.4 / 204.8) |
+
+Liquid now moves more (mean speed in a shake 1.57 vs gravel 0.44 cells/step,
+1.8 vs 1.1 sub-steps per moving grain): that is the requested behaviour, and
+most of the extra cost. Board estimate (≈ 14× host for moving work): liquid
+shake mean ~5 ms, single-step worst ~8–9 ms; continuous steering mean
+~4.4 ms, worst ~9 ms; held in hand ~1–1.3 ms; all-awake bursts ~5 ms. The
+worst single steps may exceed the 7 ms target during sustained hard shaking
+or continuous rotation; see the report for options.
+
+### Liquid round (2026-10-26)
+
+**Hardware before:** the water was jumpy, as if constantly agitated; its own
+droplets landing on the body set off more splashes until the surface erupted.
+Wanted: a slightly viscous liquid that still splashes, and no feedback.
+Changes: the rename (overlay "LIQUID", looks "green liquid" / "orange
+liquid"), items 3–8 of the liquid model as they were then (update order, viscosity,
+capped impact flow, spray, collective energy-bounded impact splash, no
+free-fall jitter) and `wave_damping` 0.01 → 0.04.
+
+`tools/sim_liquidfx.c` results (defaults):
+
+| Test | result |
+|---|---|
+| 5 drops from 20 cells onto a settled pool | land at 0.21 s; after that total motion rises on 1 step by 0.02 (one grain picking up speed down a slope), never over a 5-step sum; 0 splashes; pool at rest at 0.53 s |
+| 5 drops, 40–68 cells (staggered) | rises on 5 single steps (largest 0.08), never over 5-step sums; 0 splashes; at rest 0.53 s |
+| 20 drops, 10–67 cells | 1 single-step rise (0.03); 0 splashes; at rest 0.53 s |
+| Knock (1 g, 4 impulses) | droplets up to 14 cells above the surface, 54 grains in the air at most, all down after 0.40 s, all spray absorbed and at rest after 0.39 s; **1** knock event, **0** impact splashes after it, 1175 spray landings absorbed |
+| Flip (53 deep, falls 107 cells) | 100 % falling at 0.1 s; body 58 → 65 → 75 → 73 rows tall at 0.1/0.2/0.4/0.6 s, at most 49 loose grains (no neighbour) before landing (was 1213 with the old update order); lands 0.59 s |
+| Flip: impact splash | 1 burst (13 trigger steps), 203 grains thrown as spray, up to 31 in the air at once, 5th-highest 10 cells above the level surface; 0 secondary splashes; level within 2 cells at 1.25 s |
+| Splash energy | thrown / landed (Σ v²) 0.27 at most, bound 0.30 |
+| Tilt 10° and back | +10.5° → −2.2°, 1 swing past level, settled 1.51 s |
+| Tilt 25° and back | +15.3° → −1.7°, 1 swing past level, settled 1.54 s |
+| Flip: spread pushes / falling grains' sideways speed | 0 / mean 0.01, max 0.83 cells/step (a few edge grains) |
+| Gravel heap → liquid | within 2 cells of level at 1.40 s |
+
+Held in hand (`tools/sim_hand.c`): liquid 73 awake, 13.5 µs/step on the host
+(unchanged); gravel unchanged.
+
+**Cost** (`tools/sim_bench.c`, host µs/step mean / worst):
+
+| Scenario | gravel | liquid | liquid, `viscosity=0` |
+|---|---|---|---|
+| awake (all woken, resting) | 97.2 / 179.7 | 91.7 / 216.9 | 90.9 / 203.5 |
+| shake | 311.0 / 490.5 | 389.6 / 629.0 | 388.3 / 660.3 |
+| freefall | 235.1 / 338.6 | 345.7 / 527.7 | 294.4 / 436.0 |
+| steer (1°/step) | 164.4 / 333.2 | 329.2 / 629.8 | 293.6 / 596.5 |
+| slosh | 103.0 / 197.0 | 174.0 / 394.3 | 166.5 / 325.3 |
+
+Board estimate (≈ 14× host for moving work, ≈ 65–70× for awake-resting):
+liquid shake mean ~5.5 ms, worst ~9 ms; steering mean ~4.6 ms, worst ~9 ms;
+held in hand ~1 ms. As in the previous round, single worst steps may pass
+the 7 ms target during sustained hard shaking or continuous rotation.
+
+Simulation memory grew by ~15 KB (update order, impact and pending-splash
+lists) to ~138 KB.
+
+### Liquid fix round (2026-10-26)
+
+**Hardware before:** the liquid poured well, but splashes made tall vertical
+lines of grains, a pour set off exaggerated reactions wherever the stream met
+the body (feedback), and splashes moved too much material. Causes: the impact
+splash triggered on a global count of fast landings per step, so a steady
+pour kept triggering it, and it threw grains straight up their columns.
+
+**Changes:** impact splash removed; landings absorbed into the local flow
+(`impact_absorb` 0.8, `impact_to_flow` 0); the knock is the only splash,
+surface-only, capped and fanned (items 5–7 above). Viscosity, update order,
+waves and idle handling unchanged.
+
+`tools/sim_liquidfx.c` results (defaults), previous round in brackets:
+
+| Test | result |
+|---|---|
+| Pour, 2-wide stream for 4 s onto a settled pool | 1871 landings absorbed; **0** cells: no grain near the impact rises above the local surface; mound beside the stream ≤ 1 cell; fastest sideways grain above the surface 0.40 cells/step; **0** splash events |
+| Pour onto the high side of a returning 25° wave | 3357 landings absorbed; **0** cells risen; height beside the stream ≤ 9 cells above the window median (the wave alone, no pour: 13); 0.41 cells/step sideways; **0** splash events |
+| Same metric with absorption off and bounce on (`impact_absorb=0 impact_to_flow=0.6 elasticity=0.5`), to check it detects reactions | grains rise 6 cells (pool) / 19 cells (wave) |
+| Knock (1 g, 4 impulses) | 100 grains thrown (cap); launch angles −15°…+53° from up (mean +21°, sd 21°; none within 5° of vertical); 0.54–1.43 cells/step; up to 10 cells high, 53 in the air at most, longest vertical run of airborne grains 2; all down 0.28 s, all absorbed and at rest 0.31 s; **1** splash event [3396 grains moved as spray, 14 cells, 54 airborne] |
+| Drops onto a pool (5 @ 20, 5 @ 40–68, 20 @ 10–67 cells) | 0 splash events; motion never rises over 5-step sums (per step: one rise of 0.06 in the first case, none in the others); at rest 0.53 s in all |
+| Tilt 25° and back | +15.7° → −1.5°, 1 swing, settled 1.55 s [+15.3° → −1.7°, 1 swing, 1.54 s] |
+| Tilt 10° and back | +10.7° → −2.0°, 1 swing, settled 1.60 s [+10.5° → −2.2°, 1.51 s] |
+| Flip | body 58 → 66 → 77 → 79 rows tall at 0.1/0.2/0.4/0.6 s, ≤ 49 loose grains; lands 0.59 s; 0 grains rise more than 2 cells above the level surface; 0 splash events; level at 1.10 s [same fall; 203 grains thrown, 31 airborne, 10 cells; level 1.25 s] |
+| Free fall: spread pushes / sideways speed of falling grains | 0 / mean 0.01, max 0.06 cells/step [0 / 0.83 max] |
+| Gravel heap → liquid | within 2 cells at 1.30 s [1.40 s] |
+
+Held in hand (`tools/sim_hand.c`): liquid 73 awake, 13.5 µs/step host
+(unchanged); gravel unchanged.
+
+**Cost** (`tools/sim_bench.c`, host µs/step mean / worst; previous round in
+brackets):
+
+| Scenario | gravel | liquid |
+|---|---|---|
+| awake | 104.4 / 186.9 | 92.5 / 297.9 [91.7 / 216.9] |
+| shake (every other step) | 316.1 / 511.3 | 138.3 / 293.2 [389.6 / 629.0]; 297 grains moving instead of 4289 |
+| freefall | 242.2 / 342.0 | 360.1 / 492.0 [345.7 / 527.7] |
+| steer (1°/step) | 166.5 / 341.5 | 337.7 / 685.1 [329.2 / 629.8] |
+| slosh | 108.5 / 229.4 | 175.4 / 302.7 [174.0 / 394.3] |
+
+Board estimate (≈ 14× host for moving work): liquid shake mean ~2 ms, worst
+~4 ms; continuous steering mean ~4.7 ms, worst ~9.6 ms (single steps may
+pass the 7 ms target); held in hand ~1 ms. Simulation memory ~132 KB (the
+impact lists are gone).
+
+### Liquid stability round (2026-10-26)
+
+**Hardware before:** pours and a knock on a calm body looked right, but when
+splashed grains fell back the body over-reacted, and sometimes the surface
+columns kept bobbing like a spectrum display with no input at all. Splashes
+were also too big.
+
+**Root cause (confirmed on the host, `tools/sim_liquidstab.c`).** The wave
+model was pumping: its moves lifted grains, gravity dropped them back, and
+nothing stopped the next lift. Three faults made that possible, each found by
+summing the height change of every wave transfer against that of the rest of
+the physics (an instrumented host copy of `sim.c`):
+1. *Unreachable drive.* In a diagonal gravity frame (board held between
+   22.5° and 67.5°) some "columns" are lines that start at a side wall and are
+   full. They can never take a grain, but their heights were part of the
+   whole-tank pressure means, so the imbalance could never be levelled. Pairs
+   kept a steady flow and lifted grains up to 8.5 cells onto their
+   neighbours (repro: held at 30°, flow energy constant at ~124, ~550
+   transfers/s for 40 s).
+2. *Unbounded lifts.* A move puts the top grain of one column on the
+   neighbouring column's top, wherever that is. In disturbed bodies single
+   moves lifted grains up to ~70 cells onto stray tops far from the body;
+   in the leaned-back random runs the waves lifted +21 000…+48 000 units of
+   height per second and gravity dropped the same back.
+3. *Double-moved mass.* The waves also moved top grains that were moving at
+   up to 1 cell/step, i.e. mass the particle body was already carrying, each
+   with its own inertia. Held at 25° the surface swung +9° → −12.5° → +10.9°
+   → −16.1°, growing. And a pour touching the body is one unbroken line of
+   grains, which read as a towering column: the waves drove mass away from
+   it all the time and dug a pit under the stream (33 cells deep on a
+   settled pool) — the exaggerated reaction where a stream meets the body.
+Spray landing only started it: a knock or the landing disturbed the surface
+enough to start the waves, which then never stopped.
+
+**Changes** (all in `wave_pass()` / `column_scan()`; item 8 above):
+- Full columns carry no pressure (`wave_wet()`).
+- No move lifts a grain more than `WAVE_MAX_LIFT` (4) steps along gravity.
+- Only top grains slower than 0.5 cells/step are moved (`WAVE_SRC_SPEED2`).
+- Column tops skip droplets, spray not yet at rest and grains still falling
+  in faster than `WAVE_FALLING` (0.6 cells/step) onto a body: landings only
+  add mass where they settle.
+- Dead band (≤ 1 cell drives nothing); once the whole surface has stayed in
+  it 0.5 s the flow is drained (×0.85/step), and after 1 s the waves end.
+  A pair that can't move loses its flow; waves end after 30 passes without a
+  move.
+- Backstop: the drive is cut and the flow halved per step if, more than 2 s
+  after the last input, the largest imbalance has reversed ≥ 3 times and the
+  flow energy has not fallen 30 % in the last second (self-sustained), or
+  in any case once waves are still running 4 s after the last input.
+- Splashes: `knock_max` 100 → 40, `knock_splash` 1.6 → 1.0.
+
+**Results** (host; "before" = the previous round's wave model and splash
+settings, rebuilt in `build-host/` for comparison):
+
+| Test | before | after |
+|---|---|---|
+| Repro: settled pool, 5 knocks 0.25 s apart, 40 s no input — upright / leaned 20° | rest 1.15 s / 1.07 s | rest 0.48 s / 0.51 s |
+| … held at 30° / at 30° leaned 20° | **never** (flow energy ~124 constant, ~550 transfers/s for 40 s) | rest 0.44 s / 0.46 s (flow energy 0 from 2 s) |
+| … held at −120°, leaned 20° | rest 1.00 s | rest 0.52 s |
+| Random: 20 × (60 s random knocks, tilts, pours; 10 s no input) | 12 of 20 at rest | 19 of 20 at rest (slowest 5.4 s); run 18 still creeping at 10 s (spread rule, leaned back, diagonal frame upside down; no wave activity; at rest at ~22 s) |
+| Backstop | — | 0 in every repro, tilt, flip, pour-on-pool and knock test; 5 times in the 20 random runs (always the 4 s rule after a big rotation into an odd pose); 3 in "pour onto a returning wave" (host pours give the sim no input, a real pour comes from a tilt) |
+| Knock (1 g, 4 impulses) | 100 grains, droplets 10 cells, 53 in the air, absorbed 0.31 s | 40 grains, 3 cells, 18 in the air, absorbed 0.18 s; 1 splash event |
+| Pour on a settled pool | beside the stream +1 / **−33** cells (pit) | +5 / −1 cells; 0 grains rise |
+| Pour on a returning 25° wave (wave alone: +6 / −9) | +9 / −44 | +14 / −12 |
+| Tilt 10° and back | +10.7° → −1.9°, 1 swing, 1.60 s | +9.4° → −1.5°, 1 swing, 1.49 s |
+| Tilt 25° and back | held reaches 16.3°; +15.7° → −1.4°, 1 swing, 1.55 s | held reaches 18.4°; +17.7° → level, no swing, 2.32 s |
+| Flip | ≤ 49 loose grains; level 1.10 s | ≤ 55 loose grains; level 0.85 s |
+| Drops on a pool | 0 splashes, rest 0.53 s | same |
+| Gravel heap → liquid | 1.30 s | 1.60 s |
+
+(The tilt tests now average the surface angle over 50 ms: the single-step fit
+jumps by several degrees while the body moves, which made earlier swing
+counts partly noise; the previous-round numbers above are re-measured with
+it.)
+
+Held in hand: liquid 73 awake, 14.5 µs/step host (unchanged). Cost
+(`tools/sim_bench.c`, liquid, host µs mean / worst): shake 121 / 267, steer
+332 / 684, freefall 343 / 449, slosh 160 / 333, awake 93 / 234. Board
+estimate (×14): steering ~4.6 ms mean, ~9.6 ms worst single step; shake
+~1.7 / ~3.7 ms; held ~1 ms. Simulation memory ~132 KB.
 
 ## Mode-name overlay
 
 On a BOOT long press, and once at boot, the material name of the new look
-("GRAVEL", "WATER") is drawn centered in the palette's brightest shade
+("GRAVEL", "LIQUID") is drawn centered in the palette's brightest shade
 (`palette_brightest()`) in a built-in 5×7 terminal font scaled ×4
 (`OVERLAY_SCALE`, reduced automatically if it would not fit; "GRAVEL" is
 140 px wide), over a backing box `OVERLAY_PAD` (6) px larger than the text.
@@ -528,7 +816,7 @@ Full strength for `OVERLAY_HOLD_MS` (600 ms), then box and text fade out
 together over `OVERLAY_FADE_MS` (400 ms): the box darkens the grains behind it
 by alpha and the text is added on top. Rendering only (core 1, after
 `render_frame()`, ~6 k pixels); the simulation keeps running. Looks are
-named "green gravel", "orange gravel", "green water", "orange water".
+named "green gravel", "orange gravel", "green liquid", "orange liquid".
 
 ## 6. IMU
 
@@ -569,7 +857,7 @@ named "green gravel", "orange gravel", "green water", "orange water".
   - (The deeper `#FF6A00` gas-plasma palette was tried and removed: too dark
     on hardware. "Orange" is the former amber, values unchanged.)
 - Each grain picks a random shade at spawn → textured piles. The material's
-  `shade_spread` scales the variation (classic 1.0; water 0.3 for a smoother
+  `shade_spread` scales the variation (classic 1.0; liquid 0.3 for a smoother
   body); the grain keeps its shade, so switching back restores the texture.
 - Brightness: settled grains at `GLOW_BASE`, moving grains up to 255, scaled by
   speed (`GLOW_SPEED_GAIN`); the brightest levels blend toward white
@@ -584,10 +872,10 @@ named "green gravel", "orange gravel", "green water", "orange water".
   (in panel byte order, see `BOARD_LCD_SWAP_BYTES`), rebuilt on palette change.
 - Sand-mode looks come from `SAND_MODE_TABLE` in `config.h`, a list of
   (name, palette, material) entries; the first is the boot default. Default
-  table: green gravel → orange gravel → green water → orange water → back
+  table: green gravel → orange gravel → green liquid → orange liquid → back
   to the start. BOOT long press steps through it; every grain stays where it
   is, only colour and behaviour change (a settled sand pile slumps flat as
-  water; water switched to sand rests and piles on the next tilt). The mode
+  liquid; liquid switched to sand rests and piles on the next tilt). The mode
   name is logged on each switch and shown in the banner. tiltdot uses
   `PALETTE_DEFAULT` (green).
 - RGB LED: palette's primary colour, slow breathing pulse whose intensity
@@ -606,7 +894,7 @@ named "green gravel", "orange gravel", "green water", "orange water".
 | Input | Action |
 |---|---|
 | BOOT short press (< `BTN_LONG_MS`) | respawn sand scattered in the top part of the screen |
-| BOOT long press (≥ `BTN_LONG_MS`, fires while held) | next sand-mode look: green gravel → orange gravel → green water → orange water |
+| BOOT long press (≥ `BTN_LONG_MS`, fires while held) | next sand-mode look: green gravel → orange gravel → green liquid → orange liquid |
 
 ## 9. Bring-up modes
 
@@ -702,7 +990,7 @@ off the sim core.
 
 **Host benchmark** (`tools/sim_bench.c`, µs/step mean / worst, best of 5):
 
-| Scenario | v1 classic | classic now | water |
+| Scenario | v1 classic | classic now | liquid |
 |---|---|---|---|
 | settled | 6.9 / 28.5 | 6.7 / 32.2 | 7.0 / 25.5 |
 | freefall (3580–3730 moving) | 242.8 / 337.0 | 206.6 / 308.8 | 240.2 / 361.7 |
@@ -713,7 +1001,7 @@ off the sim core.
 
 **Board estimate:** the hardware figures for v1 (4–6 ms mean, ~9 ms max in
 heavy motion) are ~17× the host v1 shake numbers. On that ratio the worst
-step becomes ~7.8 ms classic and ~8.2 ms water before the IRAM and IMU-core
+step becomes ~7.8 ms classic and ~8.2 ms liquid before the IRAM and IMU-core
 changes, which the host cannot measure; they remove flash-cache misses
 shared with the render core and 200 Hz preemption of the sim task. Expected
 worst case therefore ~6.5–7.5 ms for both materials — at or slightly above
@@ -721,7 +1009,7 @@ the 7 ms target. Held in hand, settled: ~0.1–0.2 ms (was 4.4 ms).
 
 If the board still shows worst steps above ~7 ms, the remaining levers all
 change behaviour, so they are left for a decision: fewer grains
-(`FILL_FRACTION`), a lower water `max_speed` or `level_rate`, or capping
+(`FILL_FRACTION`), a lower liquid `max_speed` or `level_rate`, or capping
 how often shake impulses are applied.
 
 ## 11. Decisions and deviations

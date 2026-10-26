@@ -1,7 +1,7 @@
-// Host tests for material WATER, material switching and sleep/wake under
+// Host tests for material LIQUID, material switching and sleep/wake under
 // hand tremor (no ESP-IDF needed).
 //
-//   cc -std=c11 -O2 -Isrc src/sim.c src/material.c tools/sim_water.c -lm -o sim_water && ./sim_water
+//   cc -std=c11 -O2 -Isrc src/sim.c src/material.c tools/sim_liquid.c -lm -o sim_liquid && ./sim_liquid
 //
 // Gravity is given in the screen frame like the IMU delivers it (x right,
 // y down, z out of the glass). Times are at SIM_HZ.
@@ -13,6 +13,7 @@
 #include "config.h"
 #include "material.h"
 #include "sim.h"
+#include "overrides.h"
 
 #define DEG (3.14159265f / 180.0f)
 
@@ -42,7 +43,7 @@ static void run(int steps)
 }
 
 // Surface relative to gravity rotated by rot_deg in the screen plane: the top
-// of every screen column holding water, compared with the ideal level line
+// of every screen column holding liquid, compared with the ideal level line
 // through their mean. Returns the spread (max - min) of that deviation in
 // cells perpendicular to the level surface, and the fitted surface angle in
 // *ret_angle.
@@ -171,11 +172,11 @@ static void imu_feed(imu_sim_t *im, const float base[3], float noise, float sway
     }
 }
 
-static material_t wm; // water, possibly with command-line overrides
+static material_t wm; // liquid, possibly with command-line overrides
 
 static const material_t *mat_of(int material)
 {
-    return material == MATERIAL_WATER ? &wm : material_get(material);
+    return material == MATERIAL_LIQUID ? &wm : material_get(material);
 }
 
 static void tremor_test(int material, float noise, float sway_deg)
@@ -202,7 +203,7 @@ static void tremor_test(int material, float noise, float sway_deg)
 }
 
 // A deliberate tilt during tremor: steps until the material reacts. Sand
-// wakes its whole pile; water wakes only grains that can move, so for it the
+// wakes its whole pile; liquid wakes only grains that can move, so for it the
 // reaction is the first step in which grains change cell.
 static void tilt_response(int material, float tilt_deg)
 {
@@ -255,7 +256,7 @@ static float time_to_level(float rot_deg, float tol, float limit)
     return -1.0f;
 }
 
-// One-line summary for a water parameter set (used to tune it).
+// One-line summary for a liquid parameter set (used to tune it).
 static void sweep_line(void)
 {
     setup(11);
@@ -278,7 +279,7 @@ static void sweep_line(void)
     sim_set_material(&sim, &wm);
     float th = time_to_level(0, 2.0f, 20.0f);
     printf("lvl %d/%d damp %.3f step %d push %.2f scan %2d maxv %.1f cf %.2f e %.2f | 45 deg level(<=2): %5.2f s | back level(<=2): %5.2f s, "
-           "rest +%.1f s, final %.0f | heap->water level: %5.2f s\n",
+           "rest +%.1f s, final %.0f | heap->liquid level: %5.2f s\n",
            wm.level_rate, wm.level_range, (double)wm.damping, wm.spread_step, (double)wm.spread_push, wm.spread_scan, (double)wm.max_speed, (double)wm.contact_friction,
            (double)wm.elasticity, (double)t45, (double)t0, (double)rest / SIM_HZ, (double)f0, (double)th);
 }
@@ -286,8 +287,8 @@ static void sweep_line(void)
 int main(int argc, char **argv)
 {
     if (argc > 1 && strcmp(argv[1], "sweep") == 0) {
-        // sim_water sweep push scan max_speed contact_friction elasticity
-        wm = *material_get(MATERIAL_WATER);
+        // sim_liquid sweep push scan max_speed contact_friction elasticity
+        wm = *material_get(MATERIAL_LIQUID);
         wm.spread_push = (float)atof(argv[2]);
         wm.spread_scan = atoi(argv[3]);
         wm.max_speed = (float)atof(argv[4]);
@@ -300,34 +301,29 @@ int main(int argc, char **argv)
         sweep_line();
         return 0;
     }
-    // Optional overrides for tuning: sim_water [push] [scan] [contact_friction] [elasticity]
-    wm = *material_get(MATERIAL_WATER);
-    if (argc > 1) {
-        wm.spread_push = (float)atof(argv[1]);
+    // name=value arguments override liquid parameters (tools/overrides.h).
+    wm = *material_get(MATERIAL_LIQUID);
+    for (int a = 1; a < argc; a++) {
+        if (!override_apply(&wm, argv[a])) {
+            fprintf(stderr, "usage: sim_liquid [name=value ...] | sim_liquid sweep push scan max_speed cf e ...\n");
+            return 2;
+        }
     }
-    if (argc > 2) {
-        wm.spread_scan = atoi(argv[2]);
-    }
-    if (argc > 3) {
-        wm.contact_friction = (float)atof(argv[3]);
-    }
-    if (argc > 4) {
-        wm.elasticity = (float)atof(argv[4]);
-    }
+    override_print(material_get(MATERIAL_LIQUID), &wm);
     const material_t *w = &wm;
     printf("material %s: elasticity %.2f, damping %.3f, contact friction %.2f, glass friction %.2f, "
            "spread scan %d, push %.2f, max speed %.1f\n",
            w->name, (double)w->elasticity, (double)w->damping, (double)w->contact_friction,
            (double)w->glass_friction, w->spread_scan, (double)w->spread_push, (double)w->max_speed);
 
-    // 1. Water pool: settle, tilt 45 deg, then back to upright.
+    // 1. Liquid pool: settle, tilt 45 deg, then back to upright.
     setup(11);
     sim_set_material(&sim, w);
     sim_spawn(&sim, SPAWN_REGION_FRACTION, 4);
     board(0, 0);
     int t0 = settle(20000);
     float ang;
-    printf("water spawn settles in %.2f s, flatness %.1f cells\n", (double)t0 / SIM_HZ, (double)flatness(0, &ang));
+    printf("liquid spawn settles in %.2f s, flatness %.1f cells\n", (double)t0 / SIM_HZ, (double)flatness(0, &ang));
 
     // Track flatness every 0.05 s; print every 0.25 s for 2 s, then each second.
     for (int phase = 0; phase < 2; phase++) {
@@ -360,12 +356,12 @@ int main(int argc, char **argv)
     }
     float level_at;
 
-    // 2. Classic heap -> water: slumps flat.
+    // 2. Classic heap -> liquid: slumps flat.
     setup(21);
     pour_heap(1800);
     float before_f = flatness(0, NULL);
     sim_set_material(&sim, w);
-    printf("classic heap (height difference %.0f cells) switched to water:\n", (double)before_f);
+    printf("classic heap (height difference %.0f cells) switched to liquid:\n", (double)before_f);
     level_at = -1.0f;
     for (int i = 1; i <= 80; i++) {
         run(SIM_HZ / 20);
@@ -383,7 +379,7 @@ int main(int argc, char **argv)
         printf("  NOT level within 2 cells in 4 s\n");
     }
 
-    // 3. Water pool -> classic: rests, then piles on the next tilt.
+    // 3. Liquid pool -> classic: rests, then piles on the next tilt.
     setup(31);
     sim_set_material(&sim, w);
     sim_spawn(&sim, SPAWN_REGION_FRACTION, 4);
@@ -393,7 +389,7 @@ int main(int argc, char **argv)
     memcpy(snap, sim.cell, sizeof(snap));
     sim_set_material(&sim, material_get(MATERIAL_CLASSIC));
     run(SIM_HZ * 2);
-    printf("water pool switched to classic: %d grains moved in 2 s, %d awake after\n", cells_changed(snap),
+    printf("liquid pool switched to classic: %d grains moved in 2 s, %d awake after\n", cells_changed(snap),
            sim.awake);
     board(0, 50);
     run(8000);
@@ -402,7 +398,7 @@ int main(int argc, char **argv)
     printf("  then rotated 50 deg: surface %.1f deg -> effective repose %.1f deg (classic from sand: 31.0)\n",
            (double)a, (double)(50.0f - a));
 
-    // 4. Water lying flat with sensor noise.
+    // 4. Liquid lying flat with sensor noise.
     setup(41);
     sim_set_material(&sim, w);
     sim_spawn(&sim, SPAWN_REGION_FRACTION, 4);
@@ -418,9 +414,9 @@ int main(int argc, char **argv)
         sim_step(&sim);
         aw += sim.awake;
     }
-    printf("water lying flat + 0.03 g noise, 2000 steps: %d grains moved, %ld awake on average\n",
+    printf("liquid lying flat + 0.03 g noise, 2000 steps: %d grains moved, %ld awake on average\n",
            cells_changed(snap), aw / 2000);
-    // Freeze point for water (lower glass friction than sand).
+    // Freeze point for liquid (lower glass friction than sand).
     for (int lean = 80; lean <= 88; lean += 2) {
         setup(42);
         sim_set_material(&sim, w);
@@ -430,7 +426,7 @@ int main(int argc, char **argv)
         memcpy(snap, sim.cell, sizeof(snap));
         board((float)lean, 90);
         run(1200);
-        printf("  water lean %d deg, turned 90: %d grains moved\n", lean, cells_changed(snap));
+        printf("  liquid lean %d deg, turned 90: %d grains moved\n", lean, cells_changed(snap));
     }
 
     // 5. Sleep/wake with a hand-held board.

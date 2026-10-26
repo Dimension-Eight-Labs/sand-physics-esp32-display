@@ -54,7 +54,7 @@
 // All per-material physics lives in one struct. The simulation engine is the
 // same for every material; the resting rule decides what a grain that sits on
 // the pile does: REPOSE (sand: slide only if the slope is steeper than the
-// angle of repose) or SPREAD (water: flow sideways toward any lower spot, so
+// angle of repose) or SPREAD (liquid: flow sideways toward any lower spot, so
 // the surface levels perpendicular to gravity).
 #define MAT_REST_REPOSE 0
 #define MAT_REST_SPREAD 1
@@ -83,17 +83,31 @@ typedef struct {
     int spread_scan;        // cells sideways a grain looks for somewhere lower
     float spread_push;      // cells/step sideways velocity given toward it
     int spread_step;        // cells it may jump toward it in one step (flow rate)
-    int level_rate;         // grains per step moved from high to low columns (0 = off)
+    int level_rate;         // levelling moves per step (global) / per column pair (waves); 0 = off
+    float wave_gain;        // >0: waves instead of global levelling; flow gained per cell of height difference
+    float wave_damping;     // fraction of the column-to-column flow lost per step
+    int wave_window;        // columns averaged on each side for the wave drive (>= width: whole tank)
+    float wave_start;       // waves start only above this imbalance (cells); smaller: quiet levelling
+    int level_global_rate;  // with waves: background global levelling moves per step
     int level_range;        // how many lines across gravity such a move may span
     float level_max_motion; // skip levelling while total motion is above this (splashing)
     // Sleep
     int wake_radius;        // cells around a vacated cell whose sleepers wake (0 = WAKE_RADIUS)
+    // Liquid behaviour (MAT_REST_SPREAD only; 0 = off). See docs/SPEC.md §5b.
+    float viscosity;        // per step, velocity pulled this far toward the liquid neighbours' mean
+    float impact_to_flow;   // landing speed turned into sideways flow (< 1; never above the landing speed)
+    float impact_absorb;    // on landing, velocity pulled this far toward the liquid neighbours' mean
+    float knock_splash;     // launch speed of thrown surface grains, cells/step per unit of shake strength
+    float knock_fan_deg;    // launch directions spread +/- this far around the splash direction
+    int knock_depth;        // grains from the top of each column that can be thrown (1..2)
+    int knock_max;          // most grains thrown by one knock
+    float knock_interior;   // sideways knock push on the rest of the body, x knock_splash
     // Look
     float shade_spread;     // 1 = full palette shade variation, 0 = one shade
 } material_t;
 
 #define MATERIAL_CLASSIC 0
-#define MATERIAL_WATER   1
+#define MATERIAL_LIQUID   1
 #define MATERIAL_COUNT   2
 
 // CLASSIC = "Classic physics v1" (docs/SPEC.md), the sand confirmed on
@@ -113,21 +127,33 @@ typedef struct {
     .shade_spread = 1.0f,                                                           \
 }
 
-// WATER: same engine, no angle of repose. Low bounce and almost no friction
-// on the pile so it sloshes; resting surface grains flow toward lower spots
-// up to spread_scan cells away; less glass friction than sand, but enough to
-// lie still when flat. Shades pulled together for a smoother body.
-#define MATERIAL_WATER_PARAMS {                                                     \
-    .name = "water",                                                                \
+// LIQUID (called "water" in earlier builds): same engine, no angle of repose, slightly
+// viscous. Low bounce and almost no friction on the pile; neighbours share
+// momentum (viscosity), so the body moves and falls as a body. A landing grain
+// is absorbed into the local flow (impact_absorb) instead of bouncing or
+// splashing; the waves make the body slosh past level once and settle.
+// Resting surface grains on solid ground flow toward lower spots up to
+// spread_scan cells away. Only a knock splashes: a capped number of surface
+// grains thrown in a fan; they are spray and are absorbed when they land.
+// Less glass friction than sand, but enough to lie still when flat. Shades
+// pulled together for a smoother body.
+#define MATERIAL_LIQUID_PARAMS {                                                     \
+    .name = "liquid",                                                                \
     .gravity_scale = 0.06f, .damping = 0.005f, .elasticity = 0.05f,                 \
     .max_speed = 2.0f, .jitter = 0.01f, .contact_friction = 0.02f,                  \
     .rest_speed = 0.15f, .glass_friction = 0.08f, .rule_token = 0.8f,               \
     .rest_rule = MAT_REST_SPREAD, .rule_prob = 1.0f,                                \
     .repose_angle_deg = 0.0f, .repose_scan = 0,                                     \
     .repose_diag_correction_deg = 0.0f, .repose_dither = 0.0f,                      \
-    .spread_scan = 24, .spread_push = 0.8f, .spread_step = 0,                       \
-    .level_rate = 8, .level_range = 86, .level_max_motion = 400.0f,                 \
+    .spread_scan = 24, .spread_push = 0.4f, .spread_step = 0,                       \
+    .level_rate = 3, .level_range = 86, .level_max_motion = 400.0f,                 \
+    .wave_gain = 0.05f, .wave_damping = 0.04f, .wave_window = 1000,                 \
+    .wave_start = 4.0f,                                                             \
+    .level_global_rate = 8,                                                         \
     .wake_radius = 1,                                                               \
+    .viscosity = 0.15f, .impact_to_flow = 0.0f, .impact_absorb = 0.8f,              \
+    .knock_splash = 1.0f, .knock_fan_deg = 35.0f, .knock_depth = 1,                 \
+    .knock_max = 40, .knock_interior = 0.1f,                                        \
     .shade_spread = 0.3f,                                                           \
 }
 
@@ -154,7 +180,7 @@ typedef struct {
 #ifndef WAKE_ANGLE_DEG
 #define WAKE_ANGLE_DEG       2.0f
 #endif
-// Water levelling is re-run only when grains moved or gravity turned by more
+// Liquid levelling is re-run only when grains moved or gravity turned by more
 // than this since the last pass that found the surface level.
 #define LEVEL_RECHECK_DEG    0.5f
 #ifndef WAKE_PULL_DELTA_G
@@ -197,7 +223,7 @@ typedef struct {
 
 // Sand-mode looks: BOOT long press steps through this table and wraps.
 // Switching keeps every grain where it is and only changes colour and
-// behaviour (a settled sand pile slumps flat as water). The first entry is
+// behaviour (a settled sand pile slumps flat as liquid). The first entry is
 // the default at boot.
 typedef struct {
     const char *name;
@@ -208,12 +234,12 @@ typedef struct {
 #define SAND_MODE_TABLE {                                \
     { "green gravel", PALETTE_GREEN, MATERIAL_CLASSIC },   \
     { "orange gravel", PALETTE_ORANGE, MATERIAL_CLASSIC }, \
-    { "green water", PALETTE_GREEN, MATERIAL_WATER },      \
-    { "orange water", PALETTE_ORANGE, MATERIAL_WATER },    \
+    { "green liquid", PALETTE_GREEN, MATERIAL_LIQUID },      \
+    { "orange liquid", PALETTE_ORANGE, MATERIAL_LIQUID },    \
 }
 
 // Mode-name overlay (sand mode): on a BOOT long press and at boot the new
-// look's material name ("GRAVEL", "WATER") is shown centered in the palette's
+// look's material name ("GRAVEL", "LIQUID") is shown centered in the palette's
 // brightest shade, at full strength for OVERLAY_HOLD_MS, then fading out over
 // OVERLAY_FADE_MS. 5x7 font scaled by OVERLAY_SCALE (smaller if it would not
 // fit), on a black box with OVERLAY_PAD pixels around the text.

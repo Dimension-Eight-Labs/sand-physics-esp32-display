@@ -19,6 +19,7 @@
 #include "config.h"
 #include "material.h"
 #include "sim.h"
+#include "overrides.h"
 
 #define DEG (3.14159265f / 180.0f)
 #define HAND_LEAN 20.0f
@@ -148,9 +149,16 @@ static void run_hand(const material_t *m)
     free(mem);
 }
 
-int main(void)
+int main(int argc, char **argv)
 {
+    // name=value arguments override liquid parameters (tools/overrides.h).
+    static material_t liquid;
+    liquid = *material_get(MATERIAL_LIQUID);
+    for (int a = 1; a < argc; a++) {
+        override_apply(&liquid, argv[a]);
+    }
+    override_print(material_get(MATERIAL_LIQUID), &liquid);
     run_hand(material_get(MATERIAL_CLASSIC));
-    run_hand(material_get(MATERIAL_WATER));
+    run_hand(&liquid);
     return 0;
 }

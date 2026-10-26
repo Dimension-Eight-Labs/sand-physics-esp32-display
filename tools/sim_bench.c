@@ -17,18 +17,23 @@
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <time.h>
 
 #include "config.h"
 #include "sim.h"
 #ifndef V1_API
 #include "material.h"
+#include "overrides.h"
 #endif
 
 #define DEG (3.14159265f / 180.0f)
 
 static sim_t sim;
 static void *mem;
+#ifndef V1_API
+static material_t mats[MATERIAL_COUNT]; // with optional liquid overrides (key=value)
+#endif
 
 static double now_us(void)
 {
@@ -44,7 +49,7 @@ static void fresh(int material)
     mem = malloc(sim_mem_bytes(GRID_W, GRID_H, n));
     sim_init(&sim, mem, GRID_W, GRID_H, n, 4242);
 #ifndef V1_API // build against the pre-material code for comparison
-    sim_set_material(&sim, material_get(material));
+    sim_set_material(&sim, &mats[material]);
 #else
     (void)material;
 #endif
@@ -112,8 +117,22 @@ static void bench(int material, scenario_t sc, int steps)
            moved / steps, sim.n);
 }
 
-int main(void)
+int main(int argc, char **argv)
 {
+#ifndef V1_API
+    for (int m = 0; m < MATERIAL_COUNT; m++) {
+        mats[m] = *material_get(m);
+    }
+    // name=value arguments override liquid parameters (tools/overrides.h),
+    // e.g. viscosity=0.3 knock_splash=0
+    for (int a = 1; a < argc; a++) {
+        override_apply(&mats[MATERIAL_LIQUID], argv[a]);
+    }
+    override_print(material_get(MATERIAL_LIQUID), &mats[MATERIAL_LIQUID]);
+#else
+    (void)argc;
+    (void)argv;
+#endif
 #ifdef V1_API
     for (int m = 0; m < 1; m++) {
         printf("classic physics v1 (reference build)\n");
