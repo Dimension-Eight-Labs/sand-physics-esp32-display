@@ -23,6 +23,7 @@
 
 #define DEG (3.14159265f / 180.0f)
 #define HAND_LEAN 20.0f
+#include "hand_model.h"
 
 static sim_t sim;
 
@@ -31,43 +32,6 @@ static double now_us(void)
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (double)ts.tv_sec * 1e6 + (double)ts.tv_nsec / 1e3;
-}
-
-static float urand(unsigned *seed)
-{
-    *seed = *seed * 1103515245u + 12345u;
-    return (float)((*seed >> 8) & 0xFFFF) / 32767.5f - 1.0f;
-}
-
-typedef struct {
-    float lp[3];
-    double t;
-    unsigned seed;
-    float extra_rot; // deliberate rotation added on top of the hand motion
-} hand_t;
-
-// Advance the simulated IMU by one sim step and return filtered gravity.
-static void hand_step(hand_t *h, float out[3])
-{
-    const double imu_dt = 1.0 / IMU_POLL_HZ;
-    double end = h->t + 1.0 / SIM_HZ;
-    while (h->t < end) {
-        float t = (float)h->t;
-        float rot = 3.0f * sinf(t * 2.0f * 3.14159265f * 0.25f) + 2.0f * sinf(t * 2.0f * 3.14159265f * 0.07f) +
-                    h->extra_rot;
-        float lean = HAND_LEAN + 2.0f * sinf(t * 2.0f * 3.14159265f * 0.3f);
-        float in_plane = cosf(lean * DEG);
-        float g[3] = {
-            in_plane * sinf(rot * DEG) + 0.03f * urand(&h->seed),
-            in_plane * cosf(rot * DEG) + 0.03f * urand(&h->seed),
-            -sinf(lean * DEG) + 0.03f * urand(&h->seed),
-        };
-        for (int i = 0; i < 3; i++) {
-            h->lp[i] += IMU_LPF_ALPHA * (g[i] - h->lp[i]);
-        }
-        h->t += imu_dt;
-    }
-    memcpy(out, h->lp, sizeof(h->lp));
 }
 
 static void run_hand(const material_t *m)
@@ -144,7 +108,7 @@ static void run_hand(const material_t *m)
     } else {
         printf("  deliberate 20 deg tilt over 0.2 s: no flow (%d cell moves in 1 s, %u transfers, %u pushes)%s\n\n",
                moved_1s, sim.n_transfers - tr0, sim.n_pushes - pu0,
-               m->rest_rule == MAT_REST_REPOSE ? " - expected for sand: 20 deg is below the angle of repose" : "");
+               m->rest_rule == MAT_REST_REPOSE ? " - expected for gravel and sand: 20 deg is below the angle of repose" : "");
     }
     free(mem);
 }
@@ -159,6 +123,7 @@ int main(int argc, char **argv)
     }
     override_print(material_get(MATERIAL_LIQUID), &liquid);
     run_hand(material_get(MATERIAL_CLASSIC));
+    run_hand(material_get(MATERIAL_SAND));
     run_hand(&liquid);
     return 0;
 }

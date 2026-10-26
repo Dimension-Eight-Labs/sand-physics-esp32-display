@@ -59,6 +59,11 @@
 #define MAT_REST_REPOSE 0
 #define MAT_REST_SPREAD 1
 
+// How a material moves (MAT_REST_REPOSE materials; liquid always uses the
+// coherent path).
+#define MAT_FLOW_CLASSIC  0 // gravel: Classic physics v1, bounces off the grain ahead
+#define MAT_FLOW_COHERENT 1 // sand: keeps pace with the grain ahead, updated along gravity
+
 typedef struct {
     const char *name;
     // Motion
@@ -93,6 +98,8 @@ typedef struct {
     float level_max_motion; // skip levelling while total motion is above this (splashing)
     // Sleep
     int wake_radius;        // cells around a vacated cell whose sleepers wake (0 = WAKE_RADIUS)
+    // Motion model (MAT_FLOW_*; 0 = classic)
+    int flow_model;
     // Liquid behaviour (MAT_REST_SPREAD only; 0 = off). See docs/SPEC.md §5b.
     float viscosity;        // per step, velocity pulled this far toward the liquid neighbours' mean
     float impact_to_flow;   // landing speed turned into sideways flow (< 1; never above the landing speed)
@@ -107,8 +114,9 @@ typedef struct {
 } material_t;
 
 #define MATERIAL_CLASSIC 0
-#define MATERIAL_LIQUID   1
-#define MATERIAL_COUNT   2
+#define MATERIAL_LIQUID  1
+#define MATERIAL_SAND    2
+#define MATERIAL_COUNT   3
 
 // CLASSIC = "Classic physics v1" (docs/SPEC.md), the sand confirmed on
 // hardware, shown to the user as "gravel". tools/sim_golden.c checks it still
@@ -155,6 +163,29 @@ typedef struct {
     .knock_splash = 1.0f, .knock_fan_deg = 35.0f, .knock_depth = 1,                 \
     .knock_max = 40, .knock_interior = 0.1f,                                        \
     .shade_spread = 0.3f,                                                           \
+}
+
+// SAND: open-hourglass sand. Piles like gravel (angle of repose 33°, the same
+// lean / glass friction behaviour), but moves on the coherent path liquid
+// uses: a grain blocked by a grain moving the same way keeps pace with it
+// instead of bouncing off, grains are updated farthest along gravity first,
+// only grains grounded through a still chain to a wall rest, and small
+// gravity changes wake only the exposed grains. So a falling stream stays
+// together, and grains in flight keep their momentum: a higher speed cap
+// (sub-stepped, never more than one cell per sub-step) and less drag mean a
+// turn of the board curves a falling stream instead of snapping it. Less
+// bounce than gravel; nothing adds energy on landing (no splash, no flow).
+#define MATERIAL_SAND_PARAMS {                                                      \
+    .name = "sand",                                                                 \
+    .gravity_scale = 0.06f, .damping = 0.002f, .elasticity = 0.15f,                 \
+    .max_speed = 4.0f, .jitter = 0.005f, .contact_friction = 0.30f,                 \
+    .rest_speed = 0.15f, .glass_friction = 0.15f, .rule_token = 0.8f,               \
+    .rest_rule = MAT_REST_REPOSE, .rule_prob = 0.35f,                               \
+    .repose_angle_deg = 33.0f, .repose_scan = 4,                                    \
+    .repose_diag_correction_deg = 4.0f, .repose_dither = 0.15f,                     \
+    .wake_radius = 0,                                                               \
+    .flow_model = MAT_FLOW_COHERENT,                                                \
+    .shade_spread = 0.6f,                                                           \
 }
 
 // In-plane gravity below this (g, after glass friction) freezes the pile:
@@ -231,11 +262,13 @@ typedef struct {
     int material;
 } sand_mode_t;
 
-#define SAND_MODE_TABLE {                                \
+#define SAND_MODE_TABLE {                                  \
     { "green gravel", PALETTE_GREEN, MATERIAL_CLASSIC },   \
     { "orange gravel", PALETTE_ORANGE, MATERIAL_CLASSIC }, \
-    { "green liquid", PALETTE_GREEN, MATERIAL_LIQUID },      \
-    { "orange liquid", PALETTE_ORANGE, MATERIAL_LIQUID },    \
+    { "green sand", PALETTE_GREEN, MATERIAL_SAND },        \
+    { "orange sand", PALETTE_ORANGE, MATERIAL_SAND },      \
+    { "green liquid", PALETTE_GREEN, MATERIAL_LIQUID },    \
+    { "orange liquid", PALETTE_ORANGE, MATERIAL_LIQUID },  \
 }
 
 // Mode-name overlay (sand mode): on a BOOT long press and at boot the new
@@ -271,6 +304,34 @@ typedef struct {
 #define LED_MOTION_FULL   400.0f
 // Breathing period of the idle pulse.
 #define LED_PULSE_PERIOD_MS 3000
+
+// ---- Idle dimming (battery) ----------------------------------------------------
+// After IDLE_DIM_AFTER_S without real activity (a knock, a tilt of more than
+// IDLE_WAKE_TILT_DEG from where the board was last moved to, sand still
+// moving, a button press) the backlight fades to IDLE_DIM_BACKLIGHT_PERCENT
+// and the LED to IDLE_DIM_LED_SCALE of its brightness over IDLE_DIM_FADE_MS.
+// Any activity restores full brightness on the next frame. Hand tremor and
+// sway (a few degrees) stay inside IDLE_WAKE_TILT_DEG, so holding the board
+// still does not keep it bright (tools/sim_idle.c checks this).
+#define IDLE_DIM_ENABLE            1
+#define IDLE_DIM_AFTER_S           180
+#define IDLE_DIM_BACKLIGHT_PERCENT 8
+#define IDLE_DIM_LED_SCALE         0.2f
+#define IDLE_DIM_FADE_MS           2000
+#define IDLE_WAKE_TILT_DEG         15.0f
+// Total sand motion (sum of grain speeds, cells/step) that counts as moving.
+#define IDLE_WAKE_MOTION           20.0f
+
+// ---- Logging ---------------------------------------------------------------------
+// Once-a-second statistics line on the console (sand mode). Off in the release
+// environment (RELEASE_BUILD); build with -DSTATS_LOG=1 to turn it back on.
+#ifndef STATS_LOG
+#if defined(RELEASE_BUILD) && RELEASE_BUILD
+#define STATS_LOG 0
+#else
+#define STATS_LOG 1
+#endif
+#endif
 
 // ---- Button --------------------------------------------------------------------------
 #define BTN_LONG_MS 700

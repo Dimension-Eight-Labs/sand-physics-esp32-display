@@ -23,9 +23,12 @@
 #define SHADE_MASK 0x03
 _Static_assert(PALETTE_SHADES <= SHADE_MASK + 1, "shade must fit in 2 bits");
 
-// Speed -> brightness, indexed by speed^2 so no square root per grain; spans
-// the fastest material.
+// Speed -> brightness, indexed by speed^2 so no square root per grain. It spans
+// 0..SPEED_LUT_SPAN cells/step; the glow saturates at (255 - GLOW_BASE) /
+// GLOW_SPEED_GAIN = 0.75 cells/step, so faster grains (sand flies up to 4)
+// share the last entry and the table stays as it was for gravel and liquid.
 #define SPEED_LUT_N     256
+#define SPEED_LUT_SPAN  2.0f
 static float s_speed_scale; // (SPEED_LUT_N - 1) / max_speed^2
 
 static uint8_t s_glow[GRID_W * GRID_H]; // level | shade, see above
@@ -84,8 +87,7 @@ static void build_lut(const palette_t *p, float spread)
 
 void render_init(int palette)
 {
-    const float max_speed = material_max_speed();
-    s_speed_scale = (float)(SPEED_LUT_N - 1) / (max_speed * max_speed);
+    s_speed_scale = (float)(SPEED_LUT_N - 1) / (SPEED_LUT_SPAN * SPEED_LUT_SPAN);
     for (int i = 0; i < SPEED_LUT_N; i++) {
         float speed = sqrtf((float)i / s_speed_scale);
         float level = (float)GLOW_BASE + GLOW_SPEED_GAIN * speed;

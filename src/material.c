@@ -4,6 +4,7 @@
 static const material_t MATERIALS[MATERIAL_COUNT] = {
     [MATERIAL_CLASSIC] = MATERIAL_CLASSIC_PARAMS,
     [MATERIAL_LIQUID] = MATERIAL_LIQUID_PARAMS,
+    [MATERIAL_SAND] = MATERIAL_SAND_PARAMS,
 };
 
 const material_t *material_get(int idx)
@@ -12,15 +13,4 @@ const material_t *material_get(int idx)
         idx = MATERIAL_CLASSIC;
     }
     return &MATERIALS[idx];
-}
-
-float material_max_speed(void)
-{
-    float m = 0.0f;
-    for (int i = 0; i < MATERIAL_COUNT; i++) {
-        if (MATERIALS[i].max_speed > m) {
-            m = MATERIALS[i].max_speed;
-        }
-    }
-    return m;
 }

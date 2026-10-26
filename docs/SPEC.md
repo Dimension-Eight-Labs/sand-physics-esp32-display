@@ -69,7 +69,12 @@ src/
   imu.[ch]       QMI8658 driver, axis mapping, low-pass, shake detection (own task)
   button.[ch]    BOOT button debounce, short/long press events
   led.[ch]       WS2812B status pulse
+  idle.[ch]      idle dimming: activity detector + dim curve (NO ESP-IDF headers)
   main.c         app: modes; sand = sim task (core 0) + render task (core 1)
+version.txt      firmware version (1.0.0), read by ESP-IDF
+sdkconfig.defaults(.release)  base / release-only SDK settings
+scripts/
+  make_release.sh  build env:release, write dist/sand-physics-<version>.bin (merged image)
 tools/
   sim_golden.c   PC test: CLASSIC reproduces Classic physics v1 bit for bit
   sim_host.c     PC harness: repose angles, tilt/lean/flat behaviour, shake recovery (classic)
@@ -77,8 +82,11 @@ tools/
   sim_hand.c     PC harness: pool / pile held in hand (tremor, sway, lean wobble): awake + cost
   sim_liquidfx.c  PC harness: liquid drops on a pool, continuous pours, free fall, sloshing, knock, flip, heap slump
   sim_liquidstab.c PC harness: liquid comes to rest on its own (knock repro, 60 s random input)
+  sim_sandfx.c    PC harness: sand (and gravel) stream arc and width, heap angles, rest after pour / shake / flip
+  sim_idle.c      PC harness: idle dimming against the hand-motion model (hand_model.h)
   overrides.h     name=value material overrides shared by the host tools
-  sim_bench.c    PC benchmark: µs per step per material, six scenarios
+  hand_model.h    hand-motion model shared by sim_hand and sim_idle
+  sim_bench.c    PC benchmark: µs per step per material, seven scenarios
 ```
 
 `sim`, `material`, `palette` and `render` only use the C standard library and
@@ -361,9 +369,12 @@ the golden scenarios wake under both rules, so they still match bit for bit.
 ## 5b. Materials
 
 All per-material physics is a `material_t` in `config.h`
-(`MATERIAL_CLASSIC_PARAMS`, `MATERIAL_LIQUID_PARAMS`); `material.c` holds the
-table. One engine; the material's *resting rule* decides what a supported,
-slow grain does: `MAT_REST_REPOSE` (sand) or `MAT_REST_SPREAD` (liquid).
+(`MATERIAL_CLASSIC_PARAMS`, `MATERIAL_SAND_PARAMS`, `MATERIAL_LIQUID_PARAMS`);
+`material.c` holds the table. One engine; the material's *resting rule*
+decides what a supported, slow grain does: `MAT_REST_REPOSE` (gravel, sand)
+or `MAT_REST_SPREAD` (liquid), and its *flow model* how it moves:
+`MAT_FLOW_CLASSIC` (gravel, v1) or the coherent path (sand, and always for
+liquid; see "Sand" below).
 `sim_set_material()` switches at any time: every grain stays where it is,
 all are woken and the gravity-derived terms are recomputed.
 
@@ -805,10 +816,105 @@ Held in hand: liquid 73 awake, 14.5 µs/step host (unchanged). Cost
 estimate (×14): steering ~4.6 ms mean, ~9.6 ms worst single step; shake
 ~1.7 / ~3.7 ms; held ~1 ms. Simulation memory ~132 KB.
 
+### Sand (hourglass round, 2026-10-26)
+
+A third material, `MATERIAL_SAND` ("sand", overlay "SAND"): open-hourglass
+sand. It piles like gravel — the same angle-of-repose rule, repose 33°, scan,
+dither, glass friction and lean behaviour — but moves on the liquid's
+coherent path (`flow_model = MAT_FLOW_COHERENT`; `step_liquid()` /
+`move_liquid()` with the liquid-only parts zero in its parameters):
+- **Coherent fall.** A grain blocked by a grain moving the same way keeps
+  pace with it instead of bouncing off; awake grains are updated farthest
+  along gravity first; only grains grounded through a still chain to a wall
+  rest. A falling stream stays 2–4 columns wide (gravel: ~12).
+- **Momentum.** Velocity is integrated as for gravel, with less drag
+  (`damping` 0.002) and a higher cap (`max_speed` 4 cells/step). Moves are
+  sub-stepped at most one cell per axis per sub-step (n = ⌈max(|vx|,|vy|)⌉
+  ≤ 4 ≤ `SIM_MAX_SUBSTEPS` 8), so no cell is skipped. Turning the board bends
+  a falling stream gradually.
+- **Bounce.** `elasticity` 0.15 (gravel 0.30). Nothing adds energy on
+  landing: no splash, impact flow or absorption; the knock is the generic
+  shake.
+- **Cheap in the hand.** Small gravity changes wake only exposed grains (a
+  frame change wakes all and re-grounds, as for liquid); buried resting
+  grains skip the repose look-ahead.
+- The renderer's speed table now spans a fixed 2 cells/step (the glow
+  saturates at 0.75), so the faster sand does not change how gravel and
+  liquid look; `material_max_speed()` is gone.
+
+| Parameter | sand | (gravel) |
+|---|---|---|
+| `gravity_scale` / `damping` / `elasticity` | 0.06 / 0.002 / 0.15 | 0.06 / 0.01 / 0.30 |
+| `max_speed` / `jitter` | 4.0 / 0.005 | 2.0 / 0.01 |
+| `contact_friction` / `rest_speed` / `glass_friction` | 0.30 / 0.15 / 0.15 | same |
+| `rule_prob` / repose angle / scan / diag correction / dither | 0.35 / 33° / 4 / 4° / 0.15 | same |
+| `wake_radius` | 0 (= 2) | same |
+| `flow_model` | `MAT_FLOW_COHERENT` | `MAT_FLOW_CLASSIC` |
+| `shade_spread` | 0.6 | 1.0 |
+
+Host results (`tools/sim_sandfx.c`; gravel alongside):
+
+| Test | gravel | sand |
+|---|---|---|
+| Stream, gravity turned 45° mid-fall: mean direction of the grains in the air (0 ms / 50 / 100 / 200 / 300 / 400 ms) | 0° / 8° / 16° / 29° / 39° / 42° at ~1.7 cells/step | 0° / 5.5° / 10° / 19° / 30° / 35° at 2.4–3.4 cells/step (about 1° per step at first) |
+| Falling stream width (2-wide source, rows 30–89) | 11.9 mean / 14 max columns | 2.8 / 4 |
+| Heap angle, lean 0 / 30 / 45 / 60 / 75° (3 seeds) | 33.2 / 34.7 / 37.3 / 43.7 / 52.5° | 33.2 / 34.6 / 37.4 / 43.7 / 52.5° |
+| Full rest (all asleep) after a 2 s pour / a 0.25 s shake / a flip | 2.76 / 1.69 / 5.82 s | 2.28 / 2.61 / 1.65 s |
+| Mechanical energy (kinetic + potential) rising on its own | never | never over any 0.5 s window; single steps up to +63 in the first second of a flip (a grain waiting behind the grain ahead keeps its speed for one step without moving, paid back on the next; the same follower rule as liquid) and ≤ 0.004 from repose creep tokens |
+| Held in hand (`tools/sim_hand.c`) | 3240 awake, 75 µs/step | 42 awake, 7.2 µs/step |
+
+Cost (`tools/sim_bench.c`, host µs mean / worst; ×14 board for moving work,
+×65–70 for awake-resting): sand shake 362 / 577 (board ~5.1 / ~8.1 ms), steer
+262 / 547 (~3.7 / ~7.7 ms), freefall 319 / 488, awake 92 / 261 (~6.0–6.4 ms
+mean); gravel shake 308 / 497 (~4.3 / ~7.0 ms). The mean is inside the 7 ms
+target; single worst steps during sustained hard shaking may reach ~8 ms
+(gravel ~7, liquid steering ~9.6). Neither a lower speed cap (2.5–4: no
+change) nor dropping the jitter (no change, and the stream turns into a
+perfectly straight 2-column line) helps: the extra cost is the per-grain
+coherent collision handling that keeps the stream together. Skipping the
+repose look-ahead for buried grains cut the awake case from 132 to 92 µs.
+
+## Release 1.0.0 (2026-10-26)
+
+No physics or material changes: gravel's golden fingerprints, the liquid
+suite (`sim_liquidfx`, `sim_liquidstab`, `sim_liquid`) and the sand suite
+(`sim_sandfx`) produce output identical to the previous round.
+
+- **Version.** `version.txt` (1.0.0) is the only place: ESP-IDF reads it when
+  `PROJECT_VER` is unset (the old fixed `set(PROJECT_VER "0.1.0")` is gone),
+  it ends up in the app descriptor (`esp_app_get_description()->version`)
+  and the boot banner. No git needed, so clean checkouts and archives build
+  the same version.
+- **`env:release`.** The demo with `-DRELEASE_BUILD=1`, also passed to CMake
+  (`board_build.cmake_extra_args`), where `CMakeLists.txt` adds
+  `sdkconfig.defaults.release`: `CONFIG_LOG_DEFAULT_LEVEL_WARN`,
+  `CONFIG_BOOTLOADER_LOG_LEVEL_WARN`, and `CONFIG_LOG_MAXIMUM_LEVEL_INFO` so the
+  app's tag can be raised again at run time. `STATS_LOG` (config.h) defaults
+  to 0 under `RELEASE_BUILD`, else 1; `-DSTATS_LOG=1` brings the statistics
+  line back (the app then raises its own tag to info). The banner uses
+  `printf` and always prints, with a `build : release / development` line.
+- **Idle dimming** (`src/idle.c`, hardware-free). The sim task feeds every
+  step's filtered gravity, shake flag and sim motion to `idle_update()`;
+  activity is a shake, gravity more than `IDLE_WAKE_TILT_DEG` (15°) from its
+  direction at the last activity, motion above `IDLE_WAKE_MOTION` (20), or a
+  button press (render task). After `IDLE_DIM_AFTER_S` (180 s) without
+  activity, `idle_dim_amount()` ramps 0 → 1 over `IDLE_DIM_FADE_MS` (2 s):
+  backlight `BACKLIGHT_PERCENT` (90 %) → `IDLE_DIM_BACKLIGHT_PERCENT` (8 %),
+  LED colour × 1 → `IDLE_DIM_LED_SCALE` (0.2). Activity resets it on the next
+  frame. `IDLE_DIM_ENABLE 0` turns it off. `tools/sim_idle.c` (hand-motion
+  model shared with `sim_hand` in `tools/hand_model.h`): held in the hand for
+  10 min, the board moves at most 5.8° and sim motion stays ≤ 0.2 for all
+  three materials, so there are 0 activity events and dimming starts at
+  180.0 s; a 30° tilt while dimmed counts after 167 ms, a knock at once.
+- **Merged image.** `scripts/make_release.sh` builds `env:release` and runs
+  `esptool merge_bin` with the offsets and flash settings from the build's
+  `flasher_args.json` (0x0 bootloader, 0x8000 partition table, 0x10000 app;
+  DIO, 80 MHz, 16 MB) into `dist/sand-physics-<version>.bin`, flashed at 0x0.
+
 ## Mode-name overlay
 
 On a BOOT long press, and once at boot, the material name of the new look
-("GRAVEL", "LIQUID") is drawn centered in the palette's brightest shade
+("GRAVEL", "SAND", "LIQUID") is drawn centered in the palette's brightest shade
 (`palette_brightest()`) in a built-in 5×7 terminal font scaled ×4
 (`OVERLAY_SCALE`, reduced automatically if it would not fit; "GRAVEL" is
 140 px wide), over a backing box `OVERLAY_PAD` (6) px larger than the text.
@@ -816,7 +922,8 @@ Full strength for `OVERLAY_HOLD_MS` (600 ms), then box and text fade out
 together over `OVERLAY_FADE_MS` (400 ms): the box darkens the grains behind it
 by alpha and the text is added on top. Rendering only (core 1, after
 `render_frame()`, ~6 k pixels); the simulation keeps running. Looks are
-named "green gravel", "orange gravel", "green liquid", "orange liquid".
+named "green gravel", "orange gravel", "green sand", "orange sand", "green
+liquid", "orange liquid".
 
 ## 6. IMU
 
@@ -872,8 +979,8 @@ named "green gravel", "orange gravel", "green liquid", "orange liquid".
   (in panel byte order, see `BOARD_LCD_SWAP_BYTES`), rebuilt on palette change.
 - Sand-mode looks come from `SAND_MODE_TABLE` in `config.h`, a list of
   (name, palette, material) entries; the first is the boot default. Default
-  table: green gravel → orange gravel → green liquid → orange liquid → back
-  to the start. BOOT long press steps through it; every grain stays where it
+  table: green gravel → orange gravel → green sand → orange sand → green
+  liquid → orange liquid → back to the start. BOOT long press steps through it; every grain stays where it
   is, only colour and behaviour change (a settled sand pile slumps flat as
   liquid; liquid switched to sand rests and piles on the next tilt). The mode
   name is logged on each switch and shown in the banner. tiltdot uses
@@ -894,7 +1001,7 @@ named "green gravel", "orange gravel", "green liquid", "orange liquid".
 | Input | Action |
 |---|---|
 | BOOT short press (< `BTN_LONG_MS`) | respawn sand scattered in the top part of the screen |
-| BOOT long press (≥ `BTN_LONG_MS`, fires while held) | next sand-mode look: green gravel → orange gravel → green liquid → orange liquid |
+| BOOT long press (≥ `BTN_LONG_MS`, fires while held) | next sand-mode look: green gravel → orange gravel → green sand → orange sand → green liquid → orange liquid |
 
 ## 9. Bring-up modes
 

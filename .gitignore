@@ -4,5 +4,8 @@ managed_components/
 # to re-apply the defaults for that environment.
 sdkconfig.*
 !sdkconfig.defaults
+!sdkconfig.defaults.release
 # Host (PC) test builds of tools/*.c
 build-host/
+# Release images written by scripts/make_release.sh
+dist/

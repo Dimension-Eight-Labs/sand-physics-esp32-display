@@ -18,6 +18,7 @@
 #include "button.h"
 #include "config.h"
 #include "display.h"
+#include "idle.h"
 #include "imu.h"
 #include "led.h"
 #include "material.h"
@@ -65,6 +66,11 @@ static void print_banner(void)
     printf("==================== phosphor sand ====================\n");
     printf(" mode      : %s (APP_MODE=%d)\n", APP_MODE_NAME, APP_MODE);
     printf(" firmware  : %s, built %s %s\n", esp_app_get_description()->version, __DATE__, __TIME__);
+#if defined(RELEASE_BUILD) && RELEASE_BUILD
+    printf(" build     : release (log level warning, stats log %s)\n", STATS_LOG ? "on" : "off");
+#else
+    printf(" build     : development (stats log %s)\n", STATS_LOG ? "on" : "off");
+#endif
     printf(" ESP-IDF   : %s\n", esp_get_idf_version());
     printf(" display   : %dx%d @ %d MHz, offset (%d,%d), invert %d, BGR %d, swap bytes %d\n",
            SCREEN_W, SCREEN_H, BOARD_LCD_SPI_HZ / 1000000, BOARD_LCD_OFFSET_X, BOARD_LCD_OFFSET_Y,
@@ -266,6 +272,7 @@ static portMUX_TYPE s_snap_lock = portMUX_INITIALIZER_UNLOCKED;
 static sim_stats_t s_stats;
 static portMUX_TYPE s_stats_lock = portMUX_INITIALIZER_UNLOCKED;
 static bool s_respawn_req; // accessed with __atomic builtins
+static int64_t s_active_us; // last real activity seen by the sim task (idle dimming), under s_stats_lock
 // Sand-mode looks (palette + material); the render task picks one, the sim
 // task applies its material. Both accessed with __atomic builtins.
 static const sand_mode_t MODES[] = SAND_MODE_TABLE;
@@ -343,6 +350,8 @@ static void sim_task(void *arg)
     int64_t last = esp_timer_get_time();
     int64_t acc_us = 0;
     int mode = 0;
+    idle_t idle;
+    idle_init(&idle, last);
 
     for (;;) {
         int64_t now = esp_timer_get_time();
@@ -372,6 +381,12 @@ static void sim_task(void *arg)
             sim_set_gravity(&s_sim, imu.gx, imu.gy, imu.gz);
             if (imu.shake > 0.0f) {
                 sim_shake(&s_sim, imu.shake_dx, imu.shake_dy, SHAKE_STRENGTH * imu.shake);
+            }
+            const float g[3] = { imu.gx, imu.gy, imu.gz };
+            if (idle_update(&idle, g, imu.shake > 0.0f, s_sim.motion, now)) {
+                portENTER_CRITICAL(&s_stats_lock);
+                s_active_us = now;
+                portEXIT_CRITICAL(&s_stats_lock);
             }
             if (__atomic_exchange_n(&s_respawn_req, false, __ATOMIC_ACQ_REL)) {
                 sim_spawn(&s_sim, SPAWN_REGION_FRACTION, PALETTE_SHADES);
@@ -448,10 +463,24 @@ static void run_sand(void)
     int64_t overlay_t0 = esp_timer_get_time();
     int overlay_mode = 0;
 
+    // Idle dimming: the button counts as activity too.
+    int64_t button_us = overlay_t0;
+    int backlight = BACKLIGHT_PERCENT;
+
+#if STATS_LOG
+    // A release build logs warnings only; the statistics line is info.
+    if (esp_log_level_get(TAG) < ESP_LOG_INFO) {
+        esp_log_level_set(TAG, ESP_LOG_INFO);
+    }
+#endif
+
     xTaskCreatePinnedToCore(sim_task, "sim", SIM_TASK_STACK, NULL, SIM_TASK_PRIO, NULL, SIM_TASK_CORE);
 
     for (;;) {
         uint32_t ev = button_take_events();
+        if (ev) {
+            button_us = esp_timer_get_time();
+        }
         if (ev & BUTTON_EVT_SHORT) {
             __atomic_store_n(&s_respawn_req, true, __ATOMIC_RELEASE);
             render_clear();
@@ -500,8 +529,24 @@ static void run_sand(void)
 
         portENTER_CRITICAL(&s_stats_lock);
         float motion = s_stats.motion;
+        int64_t active_us = s_active_us > button_us ? s_active_us : button_us;
         portEXIT_CRITICAL(&s_stats_lock);
-        led_update(palette_get(render_palette())->led, motion / LED_MOTION_FULL, now_ms());
+
+        // Idle dimming: fade the backlight and LED after a while without
+        // activity; back to full on the first frame after any.
+        const float dim = idle_dim_amount(t2 - active_us);
+        const int want_bl = BACKLIGHT_PERCENT + (int)lroundf((float)(IDLE_DIM_BACKLIGHT_PERCENT - BACKLIGHT_PERCENT) * dim);
+        if (want_bl != backlight) {
+            backlight = want_bl;
+            display_set_backlight(backlight);
+        }
+        uint32_t led = palette_get(render_palette())->led;
+        if (dim > 0.0f) {
+            const float k = 1.0f - (1.0f - IDLE_DIM_LED_SCALE) * dim;
+            led = ((uint32_t)((float)((led >> 16) & 0xFF) * k) << 16) | ((uint32_t)((float)((led >> 8) & 0xFF) * k) << 8) |
+                  (uint32_t)((float)(led & 0xFF) * k);
+        }
+        led_update(led, motion / LED_MOTION_FULL, now_ms());
 
         frames++;
         wait_us += t1 - t0;
@@ -512,14 +557,16 @@ static void run_sand(void)
             st = s_stats;
             s_stats = (sim_stats_t){ .awake = st.awake, .motion = st.motion };
             portEXIT_CRITICAL(&s_stats_lock);
+#if STATS_LOG
             float secs = (float)(t2 - stat_t0) / 1e6f;
             ESP_LOGI(TAG, "fps %.1f (%d new) | sim %.0f steps/s, %" PRId64 " us/step (max %" PRId64
                      "), %d awake | snapshot %" PRId64 " us | render %" PRId64 " us | dma wait %" PRId64
-                     " us | motion %.0f%s",
+                     " us | motion %.0f%s%s",
                      (double)((float)frames / secs), new_frames, (double)((float)st.steps / secs),
                      st.steps ? st.step_us / st.steps : 0, st.max_step_us, st.awake,
                      st.snaps ? st.snap_us / st.snaps : 0, render_us / frames, wait_us / frames,
-                     (double)st.motion, st.lost_us ? " | SIM BEHIND REAL TIME" : "");
+                     (double)st.motion, st.lost_us ? " | SIM BEHIND REAL TIME" : "", dim > 0.0f ? " | dimmed" : "");
+#endif
             if (st.lost_us) {
                 ESP_LOGW(TAG, "simulation lost %" PRId64 " ms of real time in the last second", st.lost_us / 1000);
             }

@@ -1,0 +1,7 @@
+# Release build (env:release): applied on top of sdkconfig.defaults.
+# Console output is warnings and errors only; the boot banner is printed
+# directly and stays. The app's own tag can still be raised to info at run
+# time (the statistics line, -DSTATS_LOG=1), so info is kept compiled in.
+CONFIG_LOG_DEFAULT_LEVEL_WARN=y
+CONFIG_LOG_MAXIMUM_LEVEL_INFO=y
+CONFIG_BOOTLOADER_LOG_LEVEL_WARN=y

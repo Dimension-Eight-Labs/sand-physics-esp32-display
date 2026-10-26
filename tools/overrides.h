@@ -28,7 +28,7 @@ static const override_field_t OVERRIDE_FIELDS[] = {
     OVR_F(repose_angle_deg), OVR_I(repose_scan), OVR_F(repose_diag_correction_deg), OVR_F(repose_dither),
     OVR_I(spread_scan), OVR_F(spread_push), OVR_I(spread_step), OVR_I(level_rate), OVR_F(wave_gain),
     OVR_F(wave_damping), OVR_I(wave_window), OVR_F(wave_start), OVR_I(level_global_rate), OVR_I(level_range),
-    OVR_F(level_max_motion), OVR_I(wake_radius),
+    OVR_F(level_max_motion), OVR_I(wake_radius), OVR_I(flow_model),
     OVR_F(viscosity), OVR_F(impact_to_flow), OVR_F(impact_absorb), OVR_F(knock_splash), OVR_F(knock_fan_deg),
     OVR_I(knock_depth), OVR_I(knock_max), OVR_F(knock_interior), OVR_F(shade_spread),
 };

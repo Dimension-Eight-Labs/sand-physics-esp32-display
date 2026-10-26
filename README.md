@@ -4,54 +4,125 @@ Tilt-driven falling-sand demo for the **Waveshare ESP32-S3-LCD-1.47B**:
 glowing monochrome grains in the style of an old phosphor terminal. Tilt to
 pour, shake to splash. Design and hardware sources: [docs/SPEC.md](docs/SPEC.md).
 
+## Using it
+
+Plug in USB-C (or a battery) and the sand falls into place. Tilt the board to
+pour, knock it to splash.
+
+| BOOT button | Action |
+|---|---|
+| short press | respawn: the material drops in fresh from the top |
+| long press (0.7 s) | next mode |
+
+Six modes, in this order (the first is the one at power-up):
+
+1. **green gravel**: coarse grains that bounce and pile at about 33°
+2. **orange gravel**
+3. **green sand**: open-hourglass sand: falls in a tidy stream that keeps its
+   momentum and curves when you turn the board, piles at about 33°
+4. **orange sand**
+5. **green liquid**: a slightly viscous liquid that pours, sloshes once and
+   settles level; a knock throws a small splash
+6. **orange liquid**
+
+Then back to green gravel. Switching modes keeps every grain where it is and
+only changes colour and behaviour (a sand pile slumps flat as liquid; liquid
+switched to sand piles up on the next tilt). The material name (GRAVEL / SAND
+/ LIQUID) shows on screen for a moment after each switch and at power-up.
+
+**Idle dimming.** Left alone for 3 minutes, the backlight fades down to a
+glow and the LED dims, to save battery. Any real tilt, a knock or a button
+press brings full brightness back at once; holding the board in your hand
+(tremor, a few degrees of sway) does not keep it awake. Timeout, dim level
+and an on/off switch are `IDLE_DIM_*` / `IDLE_WAKE_*` in `src/config.h`.
+
 ## Build, flash, monitor
 
-Each bring-up mode is its own PlatformIO environment (`sand` is the default):
+PlatformIO environments (`sand` is the default for `pio run`):
 
 ```sh
+pio run -e release     -t upload    # production build: warnings-only log, no stats line
+pio run -e sand        -t upload    # development build of the same firmware (stats line every second)
 pio run -e testpattern -t upload    # colour bars / offset / orientation check
 pio run -e tiltdot     -t upload    # rolling dot + raw accelerometer log
-pio run -e sand        -t upload    # the demo (same as plain `pio run -t upload`)
 pio device monitor                  # logs over native USB (USB-Serial-JTAG)
 ```
 
 Build and upload, then monitor, in one go: `pio run -e tiltdot -t upload -t monitor`.
+
+The firmware version lives in **`version.txt`** (now `1.0.0`); ESP-IDF puts
+it in the app descriptor and the boot banner shows it. It does not depend on
+git, so a clean checkout or a source archive builds the same version.
+
+`release` is the demo built with `-DRELEASE_BUILD=1`: `sdkconfig.defaults.release`
+is applied on top of `sdkconfig.defaults` (console log level warning, also
+for the bootloader) and the once-a-second statistics line is off. The boot
+banner is still printed. To get the statistics back in a release build, add
+`-DSTATS_LOG=1` to `[env:release] build_flags`.
 
 Port, monitor speed and filters are set in `platformio.ini` (`/dev/ttyACM0`).
 If the port doesn't show up, hold BOOT while plugging in the cable.
 
 Serial notes for this board (native USB, no UART chip):
 
-- Every boot prints a banner with the mode, firmware and ESP-IDF version,
-  IMU address/WHO_AM_I and free heap. Boot output is usually over before the
-  monitor attaches, so the banner is printed **again whenever a monitor
-  connects**.
+- Every boot prints a banner with the mode, firmware version and build type
+  (release / development), ESP-IDF version, IMU address/WHO_AM_I and free
+  heap. Boot output is usually over before the monitor attaches, so the
+  banner is printed **again whenever a monitor connects**.
 - Pressing RESET (or any reboot) drops the USB device for a moment; the
   monitor may need restarting after that.
 - `testpattern` prints an `alive` line every second, `tiltdot` prints the
-  accelerometer 10× per second, `sand` prints timing stats every second.
+  accelerometer 10× per second, `sand` prints timing stats every second
+  (`release` only warnings).
 
 PlatformIO platform `espressif32@7.0.1` (ESP-IDF 6.0.1). Each environment
-gets its own generated `sdkconfig.<env>` (`sdkconfig.sand`,
-`sdkconfig.tiltdot`, `sdkconfig.testpattern`) created from
-`sdkconfig.defaults`. After changing `sdkconfig.defaults`, delete those
-generated files so the defaults are applied again.
+gets its own generated `sdkconfig.<env>` (`sdkconfig.release`,
+`sdkconfig.sand`, `sdkconfig.tiltdot`, `sdkconfig.testpattern`) created from
+`sdkconfig.defaults` (plus `sdkconfig.defaults.release` for `release`). After
+changing a defaults file, delete the generated files so the defaults are
+applied again.
 
-## Controls
+## Flashing a new board
 
-| BOOT button | Action |
-|---|---|
-| short press | respawn the sand at the top |
-| long press (0.7 s) | next look: green gravel → orange gravel → green liquid → orange liquid → … |
+**One merged image (no PlatformIO needed on the flashing machine).** Build
+it once:
 
-Switching looks keeps every grain where it is and only changes colour and
-behaviour: a sand pile slumps flat as liquid, liquid switched to sand stays
-put and piles at the angle of repose on the next tilt. The serial log shows
-the new mode name (`mode: green liquid (palette green, material liquid)`), and
-the screen briefly shows the material name (GRAVEL / LIQUID) in the new
-colour: full strength for 0.6 s, then fading out over 0.4 s
-(`OVERLAY_HOLD_MS`, `OVERLAY_FADE_MS`, `OVERLAY_SCALE` in `config.h`). It is
-also shown once at boot.
+```sh
+scripts/make_release.sh
+```
+
+This builds `env:release` and writes `dist/sand-physics-<version>.bin`
+(`dist/sand-physics-1.0.0.bin`): bootloader at 0x0, partition table at
+0x8000 and app at 0x10000, merged into one file that is written at offset
+0x0. The offsets and flash settings (DIO, 80 MHz, 16 MB) come from the
+build's `flasher_args.json`. The script prints the file's size and SHA-256.
+
+Flash a board over its USB-C port:
+
+```sh
+esptool.py --chip esp32s3 --port /dev/ttyACM0 write_flash 0x0 dist/sand-physics-1.0.0.bin
+```
+
+That is esptool 4.x (`pip install "esptool<5"`, or PlatformIO's copy:
+`~/.platformio/penv/bin/python ~/.platformio/packages/tool-esptoolpy/esptool.py`).
+With esptool 5.x the same command is
+`esptool --chip esp32s3 --port /dev/ttyACM0 write-flash 0x0 dist/sand-physics-1.0.0.bin`.
+On Windows the port is `COMx`, on macOS `/dev/cu.usbmodem…`. If the board
+doesn't connect (an unknown or crashing firmware on it), hold BOOT while
+plugging in the cable, flash, then press RESET. Boards that ran something
+else before can be wiped first with `esptool.py --chip esp32s3 --port
+/dev/ttyACM0 erase_flash` (this firmware stores nothing in flash, so it is
+optional).
+
+**With PlatformIO.** From a checkout:
+
+```sh
+pio run -e release -t upload
+```
+
+builds and writes bootloader, partition table and app to their offsets in one
+go (same result as the merged image). Add `--upload-port <port>` if the board
+is not on `/dev/ttyACM0`, and `-t erase` before `-t upload` to wipe it first.
 
 ## Configuration
 
@@ -112,6 +183,8 @@ The first entry is the look at boot.
 #define SAND_MODE_TABLE {                                  \
     { "green gravel", PALETTE_GREEN, MATERIAL_CLASSIC },   \
     { "orange gravel", PALETTE_ORANGE, MATERIAL_CLASSIC }, \
+    { "green sand", PALETTE_GREEN, MATERIAL_SAND },        \
+    { "orange sand", PALETTE_ORANGE, MATERIAL_SAND },      \
     { "green liquid", PALETTE_GREEN, MATERIAL_LIQUID },    \
     { "orange liquid", PALETTE_ORANGE, MATERIAL_LIQUID },  \
 }
@@ -120,12 +193,14 @@ The first entry is the look at boot.
 Palettes (`PALETTE_GREEN`, `PALETTE_ORANGE`; 4 shades each plus the LED
 colour) are in `src/palette.c`. `PALETTE_DEFAULT` only sets the tiltdot colour.
 
-Materials are `material_t` structs in `config.h` (`MATERIAL_CLASSIC_PARAMS`,
-`MATERIAL_LIQUID_PARAMS`), one engine with per-material parameters:
+Materials are `material_t` structs in `config.h` (`MATERIAL_CLASSIC_PARAMS`
+"gravel", `MATERIAL_SAND_PARAMS` "sand", `MATERIAL_LIQUID_PARAMS` "liquid"),
+one engine with per-material parameters:
 
 | Field | Effect |
 |---|---|
-| `rest_rule` | `MAT_REST_REPOSE` (sand piles at an angle) or `MAT_REST_SPREAD` (liquid levels) |
+| `rest_rule` | `MAT_REST_REPOSE` (gravel and sand pile at an angle) or `MAT_REST_SPREAD` (liquid levels) |
+| `flow_model` | `MAT_FLOW_CLASSIC` (gravel: v1, grains bounce off the grain ahead) or `MAT_FLOW_COHERENT` (sand: a falling stream keeps together, updated along gravity, only the surface wakes on small tilts) |
 | `repose_angle_deg`, `rule_prob` | steepest stable pile slope; how eagerly resting grains act |
 | `gravity_scale`, `max_speed`, `damping` | how fast grains fall and flow |
 | `elasticity`, `contact_friction` | bounce on impact, skid along the pile |
@@ -139,7 +214,7 @@ Materials are `material_t` structs in `config.h` (`MATERIAL_CLASSIC_PARAMS`,
 | `impact_to_flow` | liquid landings: extra sideways flow from the landing speed (0 = off; never faster than the landing) |
 | `knock_splash`, `knock_fan_deg` | liquid knock: launch speed of thrown grains per unit of shake; spread of their launch directions (± degrees around up, leaning with the knock) |
 | `knock_depth`, `knock_max`, `knock_interior` | liquid knock: how many grains from the top of each column can be thrown (1–2); most grains thrown per knock; sideways push on the rest of the body |
-| `shade_spread` | shade variation: 1 = full palette texture (sand), lower = smoother (liquid) |
+| `shade_spread` | shade variation: 1 = full palette texture (gravel), lower = smoother (sand 0.6, liquid 0.3) |
 
 The knock is the liquid's only splash. Falling or poured liquid never
 splashes: it is absorbed where it lands. Grains thrown by a knock are
@@ -189,10 +264,12 @@ $B tools/sim_bench.c    -lm -o build-host/sim_bench    && build-host/sim_bench  
 $B tools/sim_hand.c     -lm -o build-host/sim_hand     && build-host/sim_hand     # held in hand: awake grains and cost over 20 s
 $B tools/sim_liquidfx.c -lm -o build-host/sim_liquidfx && build-host/sim_liquidfx # liquid: drops, pours, sloshing, knock, flip
 $B tools/sim_liquidstab.c -lm -o build-host/sim_liquidstab && build-host/sim_liquidstab # liquid always comes to rest: knock repro, 20 x 60 s random input
+$B tools/sim_sandfx.c   -lm -o build-host/sim_sandfx   && build-host/sim_sandfx   # sand vs gravel: stream arc / width, heap angles, rest checks
+$B src/idle.c tools/sim_idle.c -lm -o build-host/sim_idle && build-host/sim_idle  # idle dimming vs the hand-motion model
 ```
 
 `sim_liquidfx`, `sim_liquidstab`, `sim_liquid`, `sim_bench` and `sim_hand` take liquid
-parameter overrides as `name=value`, for any numeric `material_t` field
+(`sim_sandfx`: sand) parameter overrides as `name=value`, for any numeric `material_t` field
 (`tools/overrides.h`), e.g. `build-host/sim_liquidfx wave_damping=0.02 viscosity=0.3`.
 Each run prints the overrides it applied; an unknown name stops with an error
 listing the valid ones. They only change the host run: to change the
@@ -200,7 +277,8 @@ firmware, edit `MATERIAL_LIQUID_PARAMS` in `config.h`.
 
 ## Serial output
 
-In `sand` mode, once per second (format; numbers illustrative):
+In the `sand` environment (and `release` built with `-DSTATS_LOG=1`), once
+per second (format; numbers illustrative):
 
 ```
 fps 60.0 (60 new) | sim 120 steps/s, 820 us/step (max 3900), 4100 awake | snapshot 300 us | render 700 us | dma wait 0 us | motion 950
@@ -214,6 +292,10 @@ fps 60.0 (60 new) | sim 120 steps/s, 820 us/step (max 3900), 4100 awake | snapsh
   almost nothing, so this is low when the sand is still.
 - `snapshot`: time on the sim core to hand a frame to the renderer.
 - `render`, `dma wait`: time on core 1 per frame.
+- `| dimmed` at the end: idle dimming is active.
+
+A `release` build prints only the boot banner and warnings, e.g. the
+`simulation lost … ms of real time` warning if the sim ever falls behind.
 
 The boot banner also shows where the simulation memory went; it should say
 `sim … in internal RAM`.

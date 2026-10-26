@@ -67,6 +67,13 @@ static inline float rsqrt(float x)
     return v.f * (1.5f - 0.5f * x * v.f * v.f);
 }
 
+// Materials on the coherent motion path (step_liquid / move_liquid, update
+// order along gravity, grounding, surface-only waking): liquid and sand.
+static inline int coherent(const material_t *m)
+{
+    return m->rest_rule == MAT_REST_SPREAD || m->flow_model == MAT_FLOW_COHERENT;
+}
+
 // 1/n for the sub-step count (n <= SIM_MAX_SUBSTEPS).
 #define SIM_MAX_SUBSTEPS 8
 static const float INV_N[SIM_MAX_SUBSTEPS + 1] = {
@@ -307,6 +314,9 @@ static void apply_gravity(sim_t *s, float gx, float gy, float gz)
         return;
     }
 
+    s->up_x = -gx / g_xy; // (sand's landing test; gravel does not use it)
+    s->up_y = -gy / g_xy;
+
     // Steepest stable slope. A grain on a slope θ is held by internal friction
     // (tan(repose) · g_xy·cosθ) plus glass friction (BACK_FRICTION · |gz|):
     //   tan θ_max = tan(repose) + glass / (g_xy · cos θ)
@@ -385,7 +395,7 @@ void sim_set_gravity(sim_t *s, float gx, float gy, float gz)
                fabsf(fabsf(gz) - fabsf(r[2])) > WAKE_PULL_DELTA_G;
     }
     if (wake) {
-        if (s->mat->rest_rule == MAT_REST_SPREAD) {
+        if (coherent(s->mat)) {
             if (s->down != s->ref_down) {
                 // "Down" changed (a flip or a big tilt): wake the whole body and
                 // ground what rests against the new floor; the rest falls.
@@ -816,11 +826,13 @@ static HOT_FN void step_grain(sim_t *s, sim_grain_t *g, int cx, int cy)
     move_grain(s, g, cx, cy);
 }
 
-// ---- Liquid step ----------------------------------------------------------------------
+// ---- Liquid (and sand) step -------------------------------------------------------------
 //
 // Liquid uses the same integration as gravel but its own support test and
 // collision response (gravel's code above is untouched, so CLASSIC stays
-// bit-identical to v1):
+// bit-identical to v1). Sand (MAT_FLOW_COHERENT) moves the same way, with the
+// liquid-only parts set to zero in its parameters (no viscosity, absorption,
+// flow, knock or levelling) and gravel's angle-of-repose rule at rest:
 //  - Supported means resting on a wall or on a grain that is not falling away;
 //    a grain on top of a falling grain is falling too. The spread rule only
 //    acts on grains grounded through a still chain down to a wall, so nothing
@@ -1060,9 +1072,17 @@ static HOT_FN void step_liquid(sim_t *s, sim_grain_t *g, int i, int cx, int cy)
         g->vx = 0.0f;
         g->vy = 0.0f;
         s->ground[i] = LIQ_GROUND; // at rest: no longer spray
-        // Both sideways cells taken: cannot spread (the whole submerged body).
+        // Both sideways cells taken: cannot spread or slide (the whole
+        // submerged body); skip the look-ahead and its random draws.
         const int l1 = (s->down + 2) & 7, l2 = (s->down + 6) & 7;
         if (!is_free(s, cx + DIR_X[l1], cy + DIR_Y[l1]) && !is_free(s, cx + DIR_X[l2], cy + DIR_Y[l2])) {
+            return;
+        }
+        if (m->rest_rule == MAT_REST_REPOSE) {
+            // Sand: the angle-of-repose rule, as gravel.
+            if (rng_unit(s) < s->rule_prob && try_repose(s, g, cx, cy)) {
+                s->motion_acc += s->token;
+            }
             return;
         }
         if (rng_unit(s) < s->rule_prob && try_spread(s, g, cx, cy)) {
@@ -1130,7 +1150,7 @@ static inline void update_grain(sim_t *s, int i)
     const int cx = (int)g->x;
     const int cy = (int)g->y;
 
-    if (s->mat->rest_rule == MAT_REST_SPREAD) {
+    if (coherent(s->mat)) {
         step_liquid(s, g, i, cx, cy);
     } else {
         step_grain(s, g, cx, cy);
@@ -1662,7 +1682,7 @@ HOT_FN void sim_step(sim_t *s)
 
     s->motion_acc = 0.0f;
     s->awake = 0;
-    if (s->mat->rest_rule == MAT_REST_SPREAD && s->down >= 0) {
+    if (coherent(s->mat) && s->down >= 0) {
         liquid_sweep(s, start, reverse);
     } else {
         int idx = start;
