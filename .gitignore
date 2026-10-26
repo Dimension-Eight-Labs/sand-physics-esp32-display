@@ -1,0 +1,6 @@
+.pio/
+managed_components/
+# Generated per environment by PlatformIO from sdkconfig.defaults; delete one
+# to re-apply the defaults for that environment.
+sdkconfig.*
+!sdkconfig.defaults

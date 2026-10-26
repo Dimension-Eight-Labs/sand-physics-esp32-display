@@ -1,0 +1,19 @@
+# Waveshare ESP32-S3-LCD-1.47B: ESP32-S3R8 (8 MB octal PSRAM in-package), 16 MB flash.
+# Flash size and octal PSRAM match the Waveshare ESP-IDF demo's sdkconfig.defaults.
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+CONFIG_PARTITION_TABLE_SINGLE_APP_LARGE=y
+
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_OCT=y
+CONFIG_SPIRAM_SPEED_80M=y
+
+# Full speed, optimised build.
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
+CONFIG_COMPILER_OPTIMIZATION_PERF=y
+
+# 1 ms ticks so the IMU task can poll at 200 Hz and frames can be paced finely.
+CONFIG_FREERTOS_HZ=1000
+
+# USB-C is wired straight to the S3's USB pins (no UART bridge), so log over
+# the built-in USB-Serial-JTAG.
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
