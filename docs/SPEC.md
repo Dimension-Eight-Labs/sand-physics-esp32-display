@@ -60,8 +60,9 @@ All values live in `src/board.h`, each with a citation. Sources:
 ```
 src/
   board.h        pins + panel constants, each with source citation
-  config.h       every tunable: app mode, palette, grain size, physics, look
-  sim.[ch]       grid + grains + step function   (NO ESP-IDF headers)
+  config.h       every tunable: app mode, material structs, look table, grain size, look
+  sim.[ch]       grid + grains + step function, both resting rules, water levelling (NO ESP-IDF headers)
+  material.[ch]  material table lookup                   (NO ESP-IDF headers)
   palette.[ch]   phosphor palettes + RGB565 LUT  (NO ESP-IDF headers)
   render.[ch]    glow/persistence buffer, frame composition (NO ESP-IDF headers)
   display.[ch]   ST7789 init, async DMA push, backlight PWM
@@ -70,20 +71,29 @@ src/
   led.[ch]       WS2812B status pulse
   main.c         app: modes; sand = sim task (core 0) + render task (core 1)
 tools/
-  sim_host.c     PC harness: repose angles, tilt/lean/flat behaviour, shake recovery
-  sim_bench.c    PC benchmark: µs per step for settled / freefall / shake / flow
+  sim_golden.c   PC test: CLASSIC reproduces Classic physics v1 bit for bit
+  sim_host.c     PC harness: repose angles, tilt/lean/flat behaviour, shake recovery (classic)
+  sim_water.c    PC harness: water levelling, material switching, tremor / wake
+  sim_hand.c     PC harness: pool / pile held in hand (tremor, sway, lean wobble): awake + cost
+  sim_bench.c    PC benchmark: µs per step per material, six scenarios
 ```
 
-`sim`, `palette` and `render` only use the C standard library and `config.h`,
-so they compile on a PC (`tools/sim_host.c`).
+`sim`, `material`, `palette` and `render` only use the C standard library and
+`config.h`, so they compile on a PC. `HOT_FN` (in `config.h`) puts hot
+functions in IRAM only when `ESP_PLATFORM` is defined, without including any
+ESP-IDF header.
 
 ### Tasks / cores (sand mode)
 
 | Task | Core | Rate | Work |
 |---|---|---|---|
-| `sim` | 0 | `SIM_HZ` (120 Hz), own clock | read IMU state, fixed sim steps, build snapshot |
-| `imu` | 0 | `IMU_POLL_HZ` (200 Hz), prio above `sim` | I2C read, mapping, filtering, shake detection |
-| `app` (render) | 1 | up to `TARGET_FPS` | button, render snapshot → frame buffer, DMA kick, LED, stats |
+| `sim` | 0 | `SIM_HZ` (120 Hz), own clock | read IMU state, apply material, fixed sim steps, build snapshot |
+| `app` (render) | 1 | up to `TARGET_FPS` | button / look switch, render snapshot → frame buffer, DMA kick, LED, stats |
+| `imu` | 1 | `IMU_POLL_HZ` (200 Hz), prio above `app` | I2C read, mapping, filtering, shake detection |
+
+The IMU task (and, because it installs the I2C driver, the I2C interrupt)
+moved to core 1 on 2026-10-26 so it no longer preempts the simulation, which
+has the tight 8.33 ms budget; rendering uses a small part of each frame.
 | button | esp_timer | 10 ms | debounce + press classification |
 
 `tiltdot` and `testpattern` run single-threaded in the `app` task.
@@ -195,12 +205,24 @@ every step (no directional bias).
 
 **Sleeping grains.** A grain that hasn't moved for `SLEEP_STEPS` (64) steps
 is skipped (a one-byte compare) until something can change its situation:
-a grain leaving a cell within `WAKE_RADIUS` (2) of it, gravity moving by more
-than `WAKE_GRAVITY_DELTA_G` (0.02 g, vector distance) or changing its snapped
-direction / frozen state, a shake, or a respawn. A sleeper count lets moving
-grains skip the neighbourhood scan entirely when nothing is asleep (the
-worst case). Radius 1 / 24 steps left piles up to 4.5° steeper than without
-sleep; 2 / 64 matches the no-sleep results within 0.8° on every host test.
+a grain leaving a cell within `WAKE_RADIUS` (2) of it, a shake, a respawn, a
+material change, or gravity having moved far enough from where it was when
+the grains last went to sleep (`ref_g`, recorded at the last wake):
+
+- the snapped direction or the frozen state changed, or
+- the in-plane direction turned by more than `WAKE_ANGLE_DEG` (2°), or
+- the in-plane or the normal magnitude changed by more than
+  `WAKE_PULL_DELTA_G` (0.06 g).
+
+Because it compares against the reference rather than the previous frame,
+slow drift still wakes the pile after 2°, while tremor around one attitude
+never does. A frozen pile (lying flat) is never woken by gravity noise at
+all. (Until 2026-10-26 the rule was a 0.02 g vector distance, which hand
+tremor crossed constantly: a held, settled pile showed 4540 awake.) A
+sleeper count lets moving grains skip the neighbourhood scan entirely when
+nothing is asleep (the worst case). Radius 1 / 24 steps left piles up to
+4.5° steeper than without sleep; 2 / 64 matches the no-sleep results
+within 0.8° on every host test.
 
 For each awake grain:
 
@@ -288,6 +310,226 @@ it out of the resting state; it then resettles under gravity.
 Per-grain speed (for brightness), total motion (sum of speeds, for the LED and
 stats).
 
+### Classic physics v1 (frozen reference)
+
+Recorded on 2026-10-26, before the material system was introduced. This is
+the behaviour confirmed on hardware ("looks and feels great"); material
+CLASSIC must reproduce it exactly. Algorithm as described in §5 above
+(support test, resting state, repose rule with glass-friction term and
+dither, PixelDust-style moving step with axis-by-axis collision, Coulomb
+glass friction, sleeping grains). Parameter values:
+
+| Parameter | Value | Meaning |
+|---|---|---|
+| `SIM_HZ` | 120 | fixed steps per second |
+| `GRAVITY_SCALE` | 0.06 | cells/step² per g of in-plane gravity |
+| `DAMPING` | 0.01 | velocity lost per step while moving |
+| `ELASTICITY` | 0.30 | velocity kept (reversed) on a blocked axis |
+| `MAX_SPEED` | 2.0 | cells/step; sub-stepped above 1 |
+| `JITTER` | 0.01 | ± cells/step on grains faster than `REST_SPEED` |
+| `CONTACT_FRICTION` | 0.30 | tangential velocity lost per step when supported |
+| `REST_SPEED` | 0.15 | below this a supported grain is resting |
+| `BACK_FRICTION` | 0.15 | glass friction per g of \|gz\| |
+| `GRAVITY_DEADZONE` | 0.03 g | net pull below this freezes the pile |
+| `REPOSE_ANGLE_DEG` | 33.0 | upright angle of repose |
+| `REPOSE_PROB` | 0.35 | × min(1, √net): chance per step a resting grain tries to slide |
+| `REPOSE_SCAN` | 4 | lateral/vertical cells scanned for the slope |
+| `REPOSE_DIAG_CORRECTION_DEG` | 4.0 | threshold reduction in diagonal gravity frames |
+| `REPOSE_DITHER` | 0.15 | ± fraction on the slide threshold |
+| repose slide token velocity | 0.8 × `REST_SPEED` | velocity given to a grain after a repose move |
+| `SLEEP_STEPS` | 64 | steps without moving before a grain sleeps |
+| `WAKE_RADIUS` | 2 | cells around a vacated cell whose sleepers wake |
+| `WAKE_GRAVITY_DELTA_G` | 0.02 g | wake-all when gravity moved this far (vector) since the last wake |
+| `SHAKE_THRESHOLD_G` | 0.60 g | \| \|a\| − 1 g \| above this is a shake |
+| `SHAKE_STRENGTH` | 0.9 | cells/step impulse per g of shake excess |
+| `IMU_POLL_HZ` / `IMU_LPF_ALPHA` | 200 / 0.15 | gravity low-pass (~30 ms) |
+| `FILL_FRACTION` / `GRAIN_PX` | 0.33 / 2 | 4540 grains on 86×160 |
+| `GLOW_BASE` / `GLOW_SPEED_GAIN` | 150 / 140 | settled brightness / per cell/step of speed |
+| `PERSISTENCE_KEEP` | 0.60 | afterglow kept per frame |
+
+Golden reference: `tools/sim_golden.c` holds state hashes (cell grid +
+every grain's position/velocity bits) for fixed-seed scenarios captured from
+this exact code; CLASSIC must reproduce them bit for bit on the host.
+
+`WAKE_GRAVITY_DELTA_G` is the one v1 value since replaced (by the wake rule
+under "Sleeping grains"); it only decides when sleepers are re-checked, and
+the golden scenarios wake under both rules, so they still match bit for bit.
+
+## 5b. Materials
+
+All per-material physics is a `material_t` in `config.h`
+(`MATERIAL_CLASSIC_PARAMS`, `MATERIAL_WATER_PARAMS`); `material.c` holds the
+table. One engine; the material's *resting rule* decides what a supported,
+slow grain does: `MAT_REST_REPOSE` (sand) or `MAT_REST_SPREAD` (water).
+`sim_set_material()` switches at any time: every grain stays where it is,
+all are woken and the gravity-derived terms are recomputed.
+
+| Field | CLASSIC (= v1) | WATER | Meaning |
+|---|---|---|---|
+| `gravity_scale` | 0.06 | 0.06 | cells/step² per g |
+| `damping` | 0.01 | 0.005 | drag per step |
+| `elasticity` | 0.30 | 0.05 | bounce on a blocked axis |
+| `max_speed` | 2.0 | 2.0 | cells/step cap |
+| `jitter` | 0.01 | 0.01 | random kick on fast grains |
+| `contact_friction` | 0.30 | 0.02 | sliding friction on the pile |
+| `rest_speed` | 0.15 | 0.15 | resting threshold |
+| `glass_friction` | 0.15 | 0.08 | Coulomb friction per g of \|gz\| |
+| `rule_token` | 0.8 | 0.8 | × rest_speed, velocity after a repose slide |
+| `rest_rule` | REPOSE | SPREAD | resting behaviour |
+| `rule_prob` | 0.35 | 1.0 | × min(1, √net) per step |
+| `repose_angle_deg` / `_scan` / `_diag_correction_deg` / `_dither` | 33 / 4 / 4 / 0.15 | — | angle of repose |
+| `spread_scan` / `spread_push` / `spread_step` | — | 24 / 0.8 / 0 | look-ahead, sideways push (cells/step), jump |
+| `level_rate` / `level_range` | 0 (off) | 8 / 86 | levelling transfers per step, reach |
+| `level_max_motion` | — | 400 | levelling paused while total motion is above this (splashing) |
+| `wake_radius` | 0 (= `WAKE_RADIUS` 2) | 1 | cells around a vacated cell whose sleepers wake |
+| `shade_spread` | 1.0 | 0.3 | palette shade variation |
+| `name` (overlay / logs) | "gravel" | "water" | user-facing name; internally still `MATERIAL_CLASSIC` |
+
+**CLASSIC verification** (host, x86-64 gcc -O2): `tools/sim_golden.c`
+matches all 8 v1 state hashes bit for bit, and `tools/sim_host.c` output is
+identical to v1 in every line (heap angles, lean, rotation, flat, tip, shake).
+On the ESP32-S3 the compiler may fuse multiply-adds differently now that the
+constants are struct fields, so the board can differ from v1 in the last
+float bit, not in behaviour.
+
+### Water model
+
+1. Same moving step as sand, with low bounce and almost no friction on the
+   pile, so it slides and sloshes, and splashes on shake.
+2. **Spread rule** (resting surface grains): look up to `spread_scan` cells
+   along each lateral direction for a spot where the grain would end at least
+   one cell lower in *true* gravity (a drop below that spot, or gravity
+   leaning toward that side by the residual tilt φ). If found, give the grain
+   a sideways velocity of `spread_push`; it slides with momentum and rests
+   again when nothing lower is in reach.
+3. **Levelling pass** (stand-in for pressure): in a one-grain-per-cell grid
+   only the surface layer can flow, so a deep pool would take 5–10 s to level
+   after a big tilt (measured: every surface-only variant tried — pushes,
+   jumps, higher speed caps — needed 5–18 s). Each step, while any water
+   grain is awake, the grid is split into lines along gravity; up to
+   `level_rate` top grains move from the highest line to the free spot above
+   the lowest line within `level_range`, only if that lowers the grain by at
+   least half a cell (so it always converges). Heights use true gravity, so
+   tilt inside the snapped frame is honoured. Water's shades are pulled
+   together (`shade_spread` 0.3), so this reads as one side of the surface
+   dropping while the other rises.
+4. Glass friction and the frozen state work as for sand: lying flat, water
+   holds still; it freezes at ~84° lean (lower glass friction than sand's
+   ~81°).
+5. **Idle cost (2026-10-26, second round).** Water differs from gravel in
+   three places that only affect cost, not the look:
+   - A gravity change wakes only *exposed* water grains (a free cell beside,
+     above or below), not the whole pool: a fully surrounded grain cannot move
+     whatever gravity does, and wakes through its neighbours if one leaves.
+     Gravel keeps wake-all, so CLASSIC stays bit-identical.
+   - A resting water grain with both sideways cells taken skips the spread
+     look-ahead and its random draw (the whole submerged body).
+   - The levelling pass is skipped while it cannot find anything new: the
+     last pass ended level, no grain changed cell since, and gravity turned
+     less than `LEVEL_RECHECK_DEG` (0.5°). It is also paused above
+     `level_max_motion` (hard splashing), and no longer requires an awake
+     grain to run.
+   - `wake_radius` 1 instead of 2 (gravel keeps 2; radius 2 exists for the
+     repose look-ahead, which water does not have). With interior grains now
+     staying asleep, radius 2 made every moving water grain scan 25 cells.
+6. Tilts that stay inside one snapped gravity frame (< 22.5°) are re-levelled
+   by levelling transfers (~3–8 grains/step) rather than by visible spread
+   pushes; bigger tilts flow physically. Unchanged from the previous round.
+
+### Material host results (`tools/sim_water.c`)
+
+| Test | Result |
+|---|---|
+| Water spawn | settles in 4.4 s, surface within 1 cell |
+| Tilt 0 → 45° | surface 40° at 0.75 s, 42° at 1.25 s, 43.7° (deviation 3.5 cells) from 4 s; at rest 5.9 s |
+| Back 45° → 0° | level within 2 cells at 0.85 s, within 1 cell at 1.25 s, all asleep at 1.75 s |
+| Classic heap (28-cell high) → water | within 2 cells at 0.35 s, 1 cell at 0.8 s |
+| Water pool → classic | 0 grains move, 0 awake; next rotation of 50° piles at effective repose 31.3° (sand alone 31.0°) |
+| Water lying flat, ±0.03 g noise | 0 grains moved |
+| Held upright, ±0.03 g tremor (± 1° sway) | 0 of 4540 awake, both materials (v1 rule: 4540) |
+| Deliberate 5° tilt during tremor | whole pile awake within 8 steps (67 ms), both materials |
+
+At 45° (a diagonal gravity frame) the levelled surface sits within ~1.9
+height units, which shows as 43.7° instead of 45° and 3.5 cells deviation
+across the width; upright it levels to 1 cell.
+
+### Water idle round (2026-10-26)
+
+**Hardware before:** water held in hand ~7 ms/step mean, 8.5–9 ms max,
+4540 awake with motion 0–11 for long stretches; gravel held 4 ms / 6–7 ms
+(accepted as is); both 0 awake, 0.53 ms lying still. Render "fps 60 (40 new)",
+sometimes 20–30 new, with the sim at 120 steps/s. One dip to 107 steps/s in a
+hard water shake.
+
+**Root cause, idle water.** `tools/sim_hand.c` (lean 20°, ±0.03 g tremor,
+±3° + ±2° in-plane sway, ±2° lean wobble) reproduces it: the hand motion
+crosses the 2° / 0.06 g wake limits about twice per second; every crossing
+woke all 4540 grains, and they need 64 steps to fall asleep again, so on
+average ~3250 were awake (gravel the same: accepted). For water each awake
+resting grain also ran the spread look-ahead every step (rule_prob 1.0) and
+the levelling pass rescanned the grid every step. Levelling transfers
+(50–80/s following the sway) were a small part; spread pushes were 0.
+
+**Fix:** item 5 of the water model above. Hand-held host results:
+
+| | before | after |
+|---|---|---|
+| water, held: awake (20 s mean) | 3254 | 73 |
+| water, held: host µs/step mean | 90.5 | 12.6 |
+| gravel, held (unchanged) | 3240 awake, 64 µs | same |
+| water, 5° tilt during tremor | — | first grains move after 4 steps (33 ms); surface only wakes (peak 160) |
+
+**Root cause, "new" frames.** The sim published a snapshot only at the end of
+a batch of steps, and only if the renderer had taken the previous one. When
+steps ran near 7–9 ms the sim fell behind and ran two steps back to back
+(14–18 ms); the gap between publishes then exceeded the 16.7 ms frame and
+frames found nothing new. A timing model (`fps 60`, ±1 ms jitter) reproduces
+it: 88 % new frames with 5–9 ms steps, 15 % with 7–9.5 ms.
+
+**Fix:** the renderer records when it takes a snapshot; after *every* step
+the sim publishes (or overwrites the waiting one) if the next frame comes
+before another step can finish (`SNAP_MARGIN_US` 3 ms of slack), or if a
+frame is already due and nothing is waiting. Each frame gets the state of
+the last step before it. Model: 99–100 % new frames for 0.5–9.5 ms steps, at
+60–100 snapshot builds/s (was ≤ 60; each is a few hundred µs on the sim
+core, shown in the stats as "snapshot").
+
+**Water cost** (host µs/step mean / worst; `tools/sim_bench.c`):
+
+| Scenario | previous round | now |
+|---|---|---|
+| awake (all woken, resting) | 123.3 / 231.0 | 50.1 / 124.7 |
+| steer (1°/step) | 220.8 / 495.7 | 189.9 / 388.7 |
+| slosh | 154.4 / 304.6 | 96.4 / 204.8 |
+| shake | 252.2 / 454.5 | 241.9 / 483.9 |
+| flow | 75.3 / 207.0 | 52.6 / 154.4 |
+| freefall | 264.1 / 396.1 | 248.1 / 333.5 |
+
+Board estimate. Two ratios fit the hardware data: resting/awake work is
+~65–70× the host (0.53 ms ↔ 8 µs lying still; 8.6 ms ↔ 123 µs all-awake
+water), moving work ~14× (gravel shake worst 6–7 ms ↔ 461 µs). Water held in
+hand: ~0.9 ms/step (was ~7). All-awake bursts: ~3.5 ms (was ~8.6). Hard
+shake: mean ~3.4 ms, single worst ~6.8 ms, the same as gravel.
+
+**Water look**, previous round → now (`tools/sim_water.c`): 45° tilt surface
+40.1° at 0.75 s in both, 43.7°/3.5 cells final in both, at rest 5.9 s → 5.0 s;
+back to upright level in 0.85 s in both; heap → water within 2 cells at 0.35 s
+in both, final 1 → 2 cells; water → gravel then 50°: effective repose 31.3° →
+31.1°; lying flat 0 moved in both (145 → 2 awake); freeze point ~84° in both.
+
+## Mode-name overlay
+
+On a BOOT long press, and once at boot, the material name of the new look
+("GRAVEL", "WATER") is drawn centered in the palette's brightest shade
+(`palette_brightest()`) in a built-in 5×7 terminal font scaled ×4
+(`OVERLAY_SCALE`, reduced automatically if it would not fit; "GRAVEL" is
+140 px wide), over a backing box `OVERLAY_PAD` (6) px larger than the text.
+Full strength for `OVERLAY_HOLD_MS` (600 ms), then box and text fade out
+together over `OVERLAY_FADE_MS` (400 ms): the box darkens the grains behind it
+by alpha and the text is added on top. Rendering only (core 1, after
+`render_frame()`, ~6 k pixels); the simulation keeps running. Looks are
+named "green gravel", "orange gravel", "green water", "orange water".
+
 ## 6. IMU
 
 - QMI8658 accel ±8 g, 250 Hz ODR, on-chip LPF off (filtering is done in
@@ -321,11 +563,14 @@ stats).
 
 ## 7. Look
 
-- Black background. Palettes in `palette.c`, ~4 shades each:
-  - **P1 green**: `#33FF33`, `#2BD92B`, `#5CFF5C`, `#22B822`
-  - **P3 amber**: `#FFB000`, `#E69A00`, `#FFC233`, `#CC8800`
-  - **orange** (gas-plasma): `#FF6A00`, `#E65A00`, `#FF8533`, `#C24E00`; LED `#FF2800`
-- Each grain picks a random shade at spawn → textured piles.
+- Black background. Palettes in `palette.c`, 4 shades each:
+  - **green** (`PALETTE_GREEN`, P1): `#33FF33`, `#2BD92B`, `#5CFF5C`, `#22B822`; LED `#00FF10`
+  - **orange** (`PALETTE_ORANGE`, P3-style amber): `#FFB000`, `#E69A00`, `#FFC233`, `#CC8800`; LED `#FF6000`
+  - (The deeper `#FF6A00` gas-plasma palette was tried and removed: too dark
+    on hardware. "Orange" is the former amber, values unchanged.)
+- Each grain picks a random shade at spawn → textured piles. The material's
+  `shade_spread` scales the variation (classic 1.0; water 0.3 for a smoother
+  body); the grain keeps its shade, so switching back restores the texture.
 - Brightness: settled grains at `GLOW_BASE`, moving grains up to 255, scaled by
   speed (`GLOW_SPEED_GAIN`); the brightest levels blend toward white
   (`HOT_WHITE_MIX`) like an overdriven phosphor.
@@ -337,8 +582,14 @@ stats).
   square root per grain.
 - Colour lookup: `lut[palette][shade][level>>2]` pre-computed RGB565
   (in panel byte order, see `BOARD_LCD_SWAP_BYTES`), rebuilt on palette change.
-- Default palette `PALETTE_DEFAULT` (green); BOOT long press cycles
-  green → amber → orange.
+- Sand-mode looks come from `SAND_MODE_TABLE` in `config.h`, a list of
+  (name, palette, material) entries; the first is the boot default. Default
+  table: green gravel → orange gravel → green water → orange water → back
+  to the start. BOOT long press steps through it; every grain stays where it
+  is, only colour and behaviour change (a settled sand pile slumps flat as
+  water; water switched to sand rests and piles on the next tilt). The mode
+  name is logged on each switch and shown in the banner. tiltdot uses
+  `PALETTE_DEFAULT` (green).
 - RGB LED: palette's primary colour, slow breathing pulse whose intensity
   follows total sand motion.
 - **LED state per mode.** `led_init()` is the first thing `app_main` does and
@@ -355,7 +606,7 @@ stats).
 | Input | Action |
 |---|---|
 | BOOT short press (< `BTN_LONG_MS`) | respawn sand scattered in the top part of the screen |
-| BOOT long press (≥ `BTN_LONG_MS`, fires while held) | cycle palette: green → amber → orange |
+| BOOT long press (≥ `BTN_LONG_MS`, fires while held) | next sand-mode look: green gravel → orange gravel → green water → orange water |
 
 ## 9. Bring-up modes
 
@@ -433,6 +684,45 @@ overlapped 11 ms DMA → 60 fps.
 steps/s (120 = real time), mean and max µs per step, awake grains; snapshot,
 render and DMA-wait µs; motion; `SIM BEHIND REAL TIME` if any sim time was
 dropped.
+
+### Materials round (2026-10-26)
+
+**Hardware, previous build:** 120 steps/s and 60 fps including shaking; sim
+in internal RAM. Held in hand and settled: 4540 awake, ~4.4 ms/step (tremor
+crossed the 0.02 g wake threshold). Lying still: ~500 awake, 1.07 ms. Heavy
+motion: 4–6 ms/step mean, ~9 ms max (over the 8.33 ms period; steps/s
+dipped to 116–117).
+
+**Changes for the budget:** the wake rule (tremor no longer wakes a held
+pile, flat never wakes); exact-result speedups in the classic path
+(two-compare bounds check, cheaper floor); hot functions in IRAM
+(`HOT_FN`: `sim_step` with its inlined helpers, `wake_around`,
+`render_frame`, `render_snapshot`); the IMU task and its I2C interrupt moved
+off the sim core.
+
+**Host benchmark** (`tools/sim_bench.c`, µs/step mean / worst, best of 5):
+
+| Scenario | v1 classic | classic now | water |
+|---|---|---|---|
+| settled | 6.9 / 28.5 | 6.7 / 32.2 | 7.0 / 25.5 |
+| freefall (3580–3730 moving) | 242.8 / 337.0 | 206.6 / 308.8 | 240.2 / 361.7 |
+| shake (worst case) | 322.3 / 541.1 | 257.3 / 460.6 | 249.2 / 482.5 |
+| flow (turn 90°) | 37.9 / 145.2 | 35.9 / 123.7 | 72.6 / 219.5 |
+| slosh (±45° every 0.5 s) | 91.6 / 194.9 | 87.4 / 177.6 | 147.0 / 302.8 |
+| steer (1°/step, nothing sleeps) | 157.5 / 356.9 | 142.9 / 383.8 | 208.1 / 424.5 |
+
+**Board estimate:** the hardware figures for v1 (4–6 ms mean, ~9 ms max in
+heavy motion) are ~17× the host v1 shake numbers. On that ratio the worst
+step becomes ~7.8 ms classic and ~8.2 ms water before the IRAM and IMU-core
+changes, which the host cannot measure; they remove flash-cache misses
+shared with the render core and 200 Hz preemption of the sim task. Expected
+worst case therefore ~6.5–7.5 ms for both materials — at or slightly above
+the 7 ms target. Held in hand, settled: ~0.1–0.2 ms (was 4.4 ms).
+
+If the board still shows worst steps above ~7 ms, the remaining levers all
+change behaviour, so they are left for a decision: fewer grains
+(`FILL_FRACTION`), a lower water `max_speed` or `level_rate`, or capping
+how often shake impulses are applied.
 
 ## 11. Decisions and deviations
 

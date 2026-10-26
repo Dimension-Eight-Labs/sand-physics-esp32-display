@@ -42,7 +42,16 @@ generated files so the defaults are applied again.
 | BOOT button | Action |
 |---|---|
 | short press | respawn the sand at the top |
-| long press (0.7 s) | next palette: P1 green → P3 amber → orange |
+| long press (0.7 s) | next look: green gravel → orange gravel → green water → orange water → … |
+
+Switching looks keeps every grain where it is and only changes colour and
+behaviour: a sand pile slumps flat as water, water switched to sand stays
+put and piles at the angle of repose on the next tilt. The serial log shows
+the new mode name (`mode: green water (palette green, material water)`), and
+the screen briefly shows the material name (GRAVEL / WATER) in the new
+colour: full strength for 0.6 s, then fading out over 0.4 s
+(`OVERLAY_HOLD_MS`, `OVERLAY_FADE_MS`, `OVERLAY_SCALE` in `config.h`). It is
+also shown once at boot.
 
 ## Configuration
 
@@ -94,13 +103,41 @@ Selected by environment (`-e testpattern | tiltdot | sand`), which sets
 `GRAIN_PX` and `PALETTE_DEFAULT` can likewise be overridden per environment
 by adding e.g. `-DGRAIN_PX=1` to that environment's `build_flags`.
 
-### Palette
+### Looks: palette + material
+
+The long-press cycle is a table in `config.h`; reorder or extend it freely.
+The first entry is the look at boot.
 
 ```c
-#define PALETTE_DEFAULT PALETTE_P1_GREEN   // or PALETTE_P3_AMBER, PALETTE_ORANGE
+#define SAND_MODE_TABLE {                                  \
+    { "green gravel", PALETTE_GREEN, MATERIAL_CLASSIC },   \
+    { "orange gravel", PALETTE_ORANGE, MATERIAL_CLASSIC }, \
+    { "green water", PALETTE_GREEN, MATERIAL_WATER },      \
+    { "orange water", PALETTE_ORANGE, MATERIAL_WATER },    \
+}
 ```
 
-Colours (4 shades each, plus the LED colour) are in `src/palette.c`.
+Palettes (`PALETTE_GREEN`, `PALETTE_ORANGE`; 4 shades each plus the LED
+colour) are in `src/palette.c`. `PALETTE_DEFAULT` only sets the tiltdot colour.
+
+Materials are `material_t` structs in `config.h` (`MATERIAL_CLASSIC_PARAMS`,
+`MATERIAL_WATER_PARAMS`), one engine with per-material parameters:
+
+| Field | Effect |
+|---|---|
+| `rest_rule` | `MAT_REST_REPOSE` (sand piles at an angle) or `MAT_REST_SPREAD` (water levels) |
+| `repose_angle_deg`, `rule_prob` | steepest stable pile slope; how eagerly resting grains act |
+| `gravity_scale`, `max_speed`, `damping` | how fast grains fall and flow |
+| `elasticity`, `contact_friction` | bounce on impact, skid along the pile |
+| `glass_friction` | friction against the glass × \|gz\|: slows grains when leaned back, freezes them near flat |
+| `repose_dither` | randomness so pile angles aren't stuck on grid slopes |
+| `spread_scan`, `spread_push` | water: how far a surface grain looks for a lower spot, how hard it is pushed there |
+| `level_rate`, `level_range` | water: how fast the surface levels after a big tilt |
+| `shade_spread` | shade variation: 1 = full palette texture (sand), lower = smoother (water) |
+
+**`MATERIAL_CLASSIC_PARAMS` ("gravel" on screen) is the sand confirmed on
+hardware ("Classic physics v1" in `docs/SPEC.md`), verified bit for bit by
+`tools/sim_golden.c`. Don't edit it; add a new material instead.**
 
 ### Grain size and amount
 
@@ -112,19 +149,14 @@ Colours (4 shades each, plus the LED colour) are in `src/palette.c`.
 With `GRAIN_PX 1` the simulation memory (~420 KB) automatically goes to
 PSRAM and the sim is ~4× more work per step; check the logged timings.
 
-### Physics and look
+### Other physics and look settings
 
-All in `config.h`, each commented. The ones that matter most:
+All in `config.h`, each commented:
 
 | Parameter | Effect |
 |---|---|
-| `REPOSE_ANGLE_DEG` | steepest stable pile slope (default 33°) |
-| `REPOSE_PROB` | how eagerly surface grains avalanche (speed, not final angle) |
-| `GRAVITY_SCALE`, `MAX_SPEED`, `DAMPING` | how fast sand falls and flows |
-| `ELASTICITY`, `CONTACT_FRICTION` | bounce on impact, skid along the pile |
-| `BACK_FRICTION` | friction against the glass, × \|gz\|: slows sand when leaned back, freezes it near flat, steepens leaned-back piles |
-| `REPOSE_DITHER` | randomness on the slide threshold so pile angles aren't stuck on grid slopes |
 | `IMU_LPF_ALPHA` | gravity smoothing (0.15 at 200 Hz ≈ 30 ms): higher = snappier, lower = calmer |
+| `WAKE_ANGLE_DEG`, `WAKE_PULL_DELTA_G` | how far gravity must move before sleeping grains are re-checked (2°, 0.06 g) |
 | `SHAKE_THRESHOLD_G`, `SHAKE_STRENGTH` | when a shake counts, how hard it splashes |
 | `GLOW_BASE`, `GLOW_SPEED_GAIN`, `HOT_WHITE_MIX` | settled vs. moving brightness |
 | `PERSISTENCE_ENABLE`, `PERSISTENCE_KEEP` | phosphor afterglow on/off and length |
@@ -132,12 +164,15 @@ All in `config.h`, each commented. The ones that matter most:
 
 ### Testing the simulation on a PC
 
-`sim.c` has no ESP-IDF dependencies. The harness measures the pile angle,
-stillness when flat, avalanche behaviour under tilt, and step time:
+`sim.c` and `material.c` have no ESP-IDF dependencies. Four host tools:
 
 ```sh
-cc -std=c11 -O2 -Wall -Wextra -Isrc src/sim.c tools/sim_host.c -lm -o sim_host
-./sim_host          # add "ascii" to print the heap
+B="cc -std=c11 -O2 -Wall -Wextra -Isrc src/sim.c src/material.c"
+$B tools/sim_golden.c -lm -o sim_golden && ./sim_golden   # CLASSIC == Classic physics v1, bit for bit
+$B tools/sim_host.c   -lm -o sim_host   && ./sim_host     # sand: pile angles, lean, flat, tip, shake
+$B tools/sim_water.c  -lm -o sim_water  && ./sim_water    # water levelling, material switching, tremor/wake
+$B tools/sim_bench.c  -lm -o sim_bench  && ./sim_bench    # µs per step, both materials, 7 scenarios
+$B tools/sim_hand.c   -lm -o sim_hand   && ./sim_hand     # held in hand: awake grains and cost over 20 s
 ```
 
 ## Serial output
@@ -168,5 +203,5 @@ per-grain code avoids them entirely (see `docs/SPEC.md` §5, §10). To compare
 step cost on a PC:
 
 ```sh
-cc -std=c11 -O2 -Isrc src/sim.c tools/sim_bench.c -lm -o sim_bench && ./sim_bench
+cc -std=c11 -O2 -Isrc src/sim.c src/material.c tools/sim_bench.c -lm -o sim_bench && ./sim_bench
 ```

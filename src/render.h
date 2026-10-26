@@ -7,9 +7,13 @@
 
 #include "sim.h"
 
-// Select the palette (rebuilds the colour table) and clear the glow buffer.
+// Build the speed table for all materials, select the palette at full shade
+// variation and clear the glow buffer.
 void render_init(int palette);
-void render_set_palette(int palette);
+
+// Palette plus shade variation (material shade_spread: 1 = palette as is,
+// smaller = shades pulled toward the primary colour). Rebuilds the colour table.
+void render_set_look(int palette, float shade_spread);
 int render_palette(void);
 
 // Forget all afterglow (e.g. on respawn).
@@ -22,6 +26,12 @@ void render_snapshot(const sim_t *s, uint8_t *snap);
 
 // Display side: decay the afterglow, merge a snapshot and write the full frame.
 void render_frame(const uint8_t *snap, uint16_t *fb);
+
+// Centered text in a blocky 5x7 terminal font, scaled up (OVERLAY_SCALE, or
+// smaller if it would not fit), over a backing box that darkens what is
+// behind it. alpha 0..1 fades box and text together. A-Z only (case
+// ignored); anything else is a space.
+void render_overlay(uint16_t *fb, const char *text, uint32_t rgb, float alpha);
 
 // Bring-up helpers.
 void render_test_pattern(uint16_t *fb);

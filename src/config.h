@@ -1,10 +1,18 @@
 // All user-tunable parameters for the demo, in one place.
 //
-// This header is included by the hardware-free modules (sim, palette, render),
-// so it must only contain plain macros.
+// This header is included by the hardware-free modules (sim, material,
+// palette, render), so it must only contain macros and type definitions.
 #pragma once
 
 #include "board.h"
+
+// Hot per-grain / per-pixel functions run from IRAM on the ESP32-S3 instead of
+// through the flash cache that both cores share. No effect on a PC build.
+#if defined(ESP_PLATFORM)
+#define HOT_FN __attribute__((section(".iram1.hot")))
+#else
+#define HOT_FN
+#endif
 
 // ---- Application mode -------------------------------------------------------
 #define MODE_TEST_PATTERN 0   // colour bars + border: check offset/orientation/colour
@@ -42,67 +50,115 @@
 // (and logged), rather than stepping in an ever-growing burst.
 #define SIM_MAX_BACKLOG_MS      100
 
-// ---- Physics (units: cells and simulation steps) -----------------------------
-// Acceleration in cells/step^2 per 1 g of in-plane gravity.
-#define GRAVITY_SCALE     0.06f
-// Fraction of velocity lost per step while moving (air drag).
-#define DAMPING           0.01f
-// Velocity kept (and reversed) on a blocked axis; 0 = dead stop, 1 = perfect bounce.
-#define ELASTICITY        0.30f
-// Speed limit in cells/step. Moves above 1 cell/step are sub-stepped.
-#define MAX_SPEED         2.0f
-// Random velocity jitter (cells/step, uniform +/-) added to moving grains.
-#define JITTER            0.01f
-// Tangential velocity lost per step while a moving grain is in contact with
-// the pile/wall below it (sliding friction).
-#define CONTACT_FRICTION  0.30f
-// A supported grain slower than this (cells/step) is "resting": its velocity is
-// zeroed and only the repose rule can move it. Must exceed GRAVITY_SCALE.
-#define REST_SPEED        0.15f
-// Coulomb friction of the sand against the glass, proportional to how hard
-// gravity presses it there: friction = BACK_FRICTION * |g_z| (in g). It slows
-// moving grains, holds still ones unless the in-plane pull is larger, and makes
-// piles stand steeper when the board is leaned back. Upright (g_z = 0) there is
-// none; the sand only moves while the screen is more than ~atan(BACK_FRICTION)
-// = 8.5° from flat (lean back < ~81.5° from vertical).
-#define BACK_FRICTION     0.15f
-// In-plane gravity below this (g, after back friction) is treated as zero.
-#define GRAVITY_DEADZONE  0.03f
+// ---- Materials (units: cells and simulation steps) ------------------------------
+// All per-material physics lives in one struct. The simulation engine is the
+// same for every material; the resting rule decides what a grain that sits on
+// the pile does: REPOSE (sand: slide only if the slope is steeper than the
+// angle of repose) or SPREAD (water: flow sideways toward any lower spot, so
+// the surface levels perpendicular to gravity).
+#define MAT_REST_REPOSE 0
+#define MAT_REST_SPREAD 1
 
-// ---- Angle of repose -------------------------------------------------------
-// Piles steeper than this (degrees, relative to true gravity) avalanche.
-#define REPOSE_ANGLE_DEG  33.0f
-// Probability per step that a resting surface grain evaluates the repose rule.
-// Lower = slower, more granular avalanches; does not change the final angle much.
-#define REPOSE_PROB       0.35f
-// How many cells sideways the slope is measured over (1..6). 1 only gives 45°
-// piles; 3-4 lets the grid represent ~30-37° slopes.
-#define REPOSE_SCAN       4
-// When gravity is closest to a grid diagonal, slopes are measured along
-// diagonals and come out ~1 cell short; lowering the threshold by this many
-// degrees keeps the settled angle consistent (measured with tools/sim_host.c).
-#define REPOSE_DIAG_CORRECTION_DEG 4.0f
-// Random +/- fraction applied to the slide threshold on every check. Lets the
-// settled angle land between the slopes the grid can represent (matters when
-// glass friction raises the angle while leaned back). 0.25 already flattens
-// upright piles noticeably.
-#define REPOSE_DITHER     0.15f
+typedef struct {
+    const char *name;
+    // Motion
+    float gravity_scale;    // cells/step^2 per g of in-plane gravity
+    float damping;          // fraction of velocity lost per step while moving (drag)
+    float elasticity;       // velocity kept (and reversed) on a blocked axis
+    float max_speed;        // cells/step; moves above 1 cell/step are sub-stepped (<= 8)
+    float jitter;           // +/- cells/step random kick for grains faster than rest_speed
+    float contact_friction; // tangential velocity lost per step when moving on the pile
+    float rest_speed;       // supported grains slower than this rest (> gravity_scale)
+    float glass_friction;   // Coulomb friction against the glass per g of |g_z|
+    float rule_token;       // velocity (x rest_speed) given after a resting-rule move
+    // Resting rule
+    int rest_rule;          // MAT_REST_REPOSE or MAT_REST_SPREAD
+    float rule_prob;        // chance per step (x min(1, sqrt(net pull))) to apply it
+    // MAT_REST_REPOSE
+    float repose_angle_deg; // steepest stable slope upright
+    int repose_scan;        // cells sideways/down the slope is measured over (1..6)
+    float repose_diag_correction_deg; // threshold reduction in diagonal gravity frames
+    float repose_dither;    // +/- fraction of random variation on the threshold
+    // MAT_REST_SPREAD
+    int spread_scan;        // cells sideways a grain looks for somewhere lower
+    float spread_push;      // cells/step sideways velocity given toward it
+    int spread_step;        // cells it may jump toward it in one step (flow rate)
+    int level_rate;         // grains per step moved from high to low columns (0 = off)
+    int level_range;        // how many lines across gravity such a move may span
+    float level_max_motion; // skip levelling while total motion is above this (splashing)
+    // Sleep
+    int wake_radius;        // cells around a vacated cell whose sleepers wake (0 = WAKE_RADIUS)
+    // Look
+    float shade_spread;     // 1 = full palette shade variation, 0 = one shade
+} material_t;
+
+#define MATERIAL_CLASSIC 0
+#define MATERIAL_WATER   1
+#define MATERIAL_COUNT   2
+
+// CLASSIC = "Classic physics v1" (docs/SPEC.md), the sand confirmed on
+// hardware, shown to the user as "gravel". tools/sim_golden.c checks it still
+// matches bit for bit: do not change these values; make a new material instead.
+#define MATERIAL_CLASSIC_PARAMS {                                                   \
+    .name = "gravel",                                                               \
+    .gravity_scale = 0.06f, .damping = 0.01f, .elasticity = 0.30f,                  \
+    .max_speed = 2.0f, .jitter = 0.01f, .contact_friction = 0.30f,                  \
+    .rest_speed = 0.15f, .glass_friction = 0.15f, .rule_token = 0.8f,               \
+    .rest_rule = MAT_REST_REPOSE, .rule_prob = 0.35f,                               \
+    .repose_angle_deg = 33.0f, .repose_scan = 4,                                    \
+    .repose_diag_correction_deg = 4.0f, .repose_dither = 0.15f,                     \
+    .spread_scan = 0, .spread_push = 0.0f, .spread_step = 0,                        \
+    .level_rate = 0, .level_range = 0, .level_max_motion = 0.0f,                    \
+    .wake_radius = 0,                                                               \
+    .shade_spread = 1.0f,                                                           \
+}
+
+// WATER: same engine, no angle of repose. Low bounce and almost no friction
+// on the pile so it sloshes; resting surface grains flow toward lower spots
+// up to spread_scan cells away; less glass friction than sand, but enough to
+// lie still when flat. Shades pulled together for a smoother body.
+#define MATERIAL_WATER_PARAMS {                                                     \
+    .name = "water",                                                                \
+    .gravity_scale = 0.06f, .damping = 0.005f, .elasticity = 0.05f,                 \
+    .max_speed = 2.0f, .jitter = 0.01f, .contact_friction = 0.02f,                  \
+    .rest_speed = 0.15f, .glass_friction = 0.08f, .rule_token = 0.8f,               \
+    .rest_rule = MAT_REST_SPREAD, .rule_prob = 1.0f,                                \
+    .repose_angle_deg = 0.0f, .repose_scan = 0,                                     \
+    .repose_diag_correction_deg = 0.0f, .repose_dither = 0.0f,                      \
+    .spread_scan = 24, .spread_push = 0.8f, .spread_step = 0,                       \
+    .level_rate = 8, .level_range = 86, .level_max_motion = 400.0f,                 \
+    .wake_radius = 1,                                                               \
+    .shade_spread = 0.3f,                                                           \
+}
+
+// In-plane gravity below this (g, after glass friction) freezes the pile:
+// it holds its shape when the board lies (nearly) flat.
+#define GRAVITY_DEADZONE  0.03f
 
 // ---- Performance: sleeping grains -----------------------------------------------
 // A grain that hasn't moved for SLEEP_STEPS steps is skipped until something
 // can change its situation: a grain leaving a cell within WAKE_RADIUS of it,
-// gravity moving by more than WAKE_GRAVITY_DELTA_G (vector distance, g), a
-// shake or a respawn. These are performance settings: with 64 / 2 the host
-// tests (tools/sim_host.c) match running without sleep to within ~0.5°;
-// radius 1 left piles up to 4.5° too steep (sleepers miss far-away changes).
+// a shake, a respawn, a material change, or gravity moving far enough from
+// where it was when the grains last went to sleep: its in-plane direction
+// turning by WAKE_ANGLE_DEG, its in-plane or normal magnitude changing by
+// WAKE_PULL_DELTA_G, or the pile freezing/unfreezing. Small hand tremor stays
+// inside these limits, so a held pile can sleep; a deliberate tilt crosses
+// them at once. With 64 / 2 the host tests match running without sleep to
+// within ~0.8°; radius 1 left piles up to 4.5° too steep.
 #ifndef SLEEP_STEPS
 #define SLEEP_STEPS          64
 #endif
 #ifndef WAKE_RADIUS
 #define WAKE_RADIUS          2
 #endif
-#ifndef WAKE_GRAVITY_DELTA_G
-#define WAKE_GRAVITY_DELTA_G 0.02f
+#ifndef WAKE_ANGLE_DEG
+#define WAKE_ANGLE_DEG       2.0f
+#endif
+// Water levelling is re-run only when grains moved or gravity turned by more
+// than this since the last pass that found the surface level.
+#define LEVEL_RECHECK_DEG    0.5f
+#ifndef WAKE_PULL_DELTA_G
+#define WAKE_PULL_DELTA_G    0.06f
 #endif
 
 // ---- Shake ----------------------------------------------------------------------
@@ -132,13 +188,39 @@
 #define IMU_SCREEN_Z_SIGN (+1)   // Z = screen normal confirmed; only |g_z| is used
 
 // ---- Look ---------------------------------------------------------------------------
-#define PALETTE_P1_GREEN 0
-#define PALETTE_P3_AMBER 1
-#define PALETTE_ORANGE   2   // gas-plasma orange
-#define PALETTE_COUNT    3   // BOOT long press cycles green -> amber -> orange
+#define PALETTE_GREEN    0   // P1 phosphor green
+#define PALETTE_ORANGE   1   // P3-style amber/orange phosphor (#FFB000 family)
+#define PALETTE_COUNT    2
 #ifndef PALETTE_DEFAULT
-#define PALETTE_DEFAULT  PALETTE_P1_GREEN
+#define PALETTE_DEFAULT  PALETTE_GREEN   // tiltdot / testpattern
 #endif
+
+// Sand-mode looks: BOOT long press steps through this table and wraps.
+// Switching keeps every grain where it is and only changes colour and
+// behaviour (a settled sand pile slumps flat as water). The first entry is
+// the default at boot.
+typedef struct {
+    const char *name;
+    int palette;
+    int material;
+} sand_mode_t;
+
+#define SAND_MODE_TABLE {                                \
+    { "green gravel", PALETTE_GREEN, MATERIAL_CLASSIC },   \
+    { "orange gravel", PALETTE_ORANGE, MATERIAL_CLASSIC }, \
+    { "green water", PALETTE_GREEN, MATERIAL_WATER },      \
+    { "orange water", PALETTE_ORANGE, MATERIAL_WATER },    \
+}
+
+// Mode-name overlay (sand mode): on a BOOT long press and at boot the new
+// look's material name ("GRAVEL", "WATER") is shown centered in the palette's
+// brightest shade, at full strength for OVERLAY_HOLD_MS, then fading out over
+// OVERLAY_FADE_MS. 5x7 font scaled by OVERLAY_SCALE (smaller if it would not
+// fit), on a black box with OVERLAY_PAD pixels around the text.
+#define OVERLAY_HOLD_MS 600
+#define OVERLAY_FADE_MS 400
+#define OVERLAY_SCALE   4
+#define OVERLAY_PAD     6
 
 // Brightness (0..255) of a settled grain.
 #define GLOW_BASE        150

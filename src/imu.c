@@ -12,6 +12,7 @@
 #include "esp_check.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
 
 #include "config.h"
@@ -32,8 +33,12 @@ static const char *TAG = "imu";
 
 #define IMU_TASK_STACK 3072
 #define IMU_TASK_PRIO  5
-#define IMU_TASK_CORE  0
+// Core 1 (with rendering): the simulation on core 0 has the tight per-step
+// budget, rendering uses a small part of each frame.
+#define IMU_TASK_CORE  1
 
+static SemaphoreHandle_t s_ready; // imu_task -> imu_init: setup finished
+static esp_err_t s_init_err = ESP_FAIL;
 static i2c_master_bus_handle_t s_bus;
 static i2c_master_dev_handle_t s_dev;
 static portMUX_TYPE s_lock = portMUX_INITIALIZER_UNLOCKED;
@@ -56,9 +61,17 @@ static inline float pick(const float a[3], int src, int sign)
     return (float)sign * a[src];
 }
 
+static esp_err_t imu_setup(void);
+
 static void imu_task(void *arg)
 {
     (void)arg;
+    s_init_err = imu_setup();
+    xSemaphoreGive(s_ready);
+    if (s_init_err != ESP_OK) {
+        vTaskDelete(NULL);
+    }
+
     float lp[3] = { 0.0f, 1.0f, 0.0f }; // gravity, screen frame; start "down"
     bool primed = false;
     TickType_t last = xTaskGetTickCount();
@@ -134,11 +147,10 @@ void imu_get(imu_state_t *out, bool consume)
     portEXIT_CRITICAL(&s_lock);
 }
 
-esp_err_t imu_init(void)
+// Bus, probe and sensor configuration. Runs in the IMU task, so the I2C
+// interrupt is installed on that task's core (see IMU_TASK_CORE).
+static esp_err_t imu_setup(void)
 {
-    // Until the sensor delivers, report plain "down" so the sand still falls.
-    s_state.gy = 1.0f;
-
     const i2c_master_bus_config_t bus_cfg = {
         .i2c_port = -1,
         .sda_io_num = BOARD_I2C_PIN_SDA,
@@ -187,8 +199,25 @@ esp_err_t imu_init(void)
     vTaskDelay(pdMS_TO_TICKS(20));
 
     ESP_LOGI(TAG, "QMI8658 at 0x%02X, WHO_AM_I 0x%02X, +/-8 g", addr, who);
+    return ESP_OK;
+}
 
+esp_err_t imu_init(void)
+{
+    // Until the sensor delivers, report plain "down" so the sand still falls.
+    s_state.gy = 1.0f;
+
+    s_ready = xSemaphoreCreateBinary();
+    if (!s_ready) {
+        return ESP_ERR_NO_MEM;
+    }
     BaseType_t ok = xTaskCreatePinnedToCore(imu_task, "imu", IMU_TASK_STACK, NULL, IMU_TASK_PRIO, NULL,
                                             IMU_TASK_CORE);
-    return ok == pdPASS ? ESP_OK : ESP_ERR_NO_MEM;
+    if (ok != pdPASS) {
+        return ESP_ERR_NO_MEM;
+    }
+    if (xSemaphoreTake(s_ready, pdMS_TO_TICKS(1000)) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
+    }
+    return s_init_err;
 }

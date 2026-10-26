@@ -1,6 +1,6 @@
 // PC test harness for the sand simulation (no ESP-IDF needed).
 //
-//   cc -std=c11 -O2 -Wall -Wextra -Isrc src/sim.c tools/sim_host.c -lm -o sim_host
+//   cc -std=c11 -O2 -Wall -Wextra -Isrc src/sim.c src/material.c tools/sim_host.c -lm -o sim_host
 //   ./sim_host            run all checks
 //   ./sim_host ascii      also print the heap
 //
@@ -19,6 +19,7 @@
 #include <time.h>
 
 #include "config.h"
+#include "material.h"
 #include "sim.h"
 
 static sim_t sim;
@@ -200,8 +201,10 @@ int main(int argc, char **argv)
     int ascii = argc > 1 && strcmp(argv[1], "ascii") == 0;
     static uint16_t before[GRID_W * GRID_H];
 
-    printf("grid %dx%d, REPOSE_ANGLE_DEG %.1f, BACK_FRICTION %.2f, SIM_HZ %d\n", GRID_W, GRID_H,
-           (double)REPOSE_ANGLE_DEG, (double)BACK_FRICTION, SIM_HZ);
+    const material_t *mat = material_get(MATERIAL_CLASSIC);
+    const float BACK_FRICTION = mat->glass_friction;
+    printf("material %s, grid %dx%d, repose %.1f deg, glass friction %.2f, SIM_HZ %d\n", mat->name,
+           GRID_W, GRID_H, (double)mat->repose_angle_deg, (double)BACK_FRICTION, SIM_HZ);
 
     // 1. Heap angle and settling time, upright and leaned back.
     static const float leans[] = { 0, 30, 60, 75 };

@@ -13,3 +13,6 @@ typedef struct {
 
 // idx is taken modulo PALETTE_COUNT.
 const palette_t *palette_get(int idx);
+
+// The palette's brightest shade (by perceived luminance), 0xRRGGBB.
+uint32_t palette_brightest(const palette_t *p);

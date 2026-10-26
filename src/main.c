@@ -20,6 +20,7 @@
 #include "display.h"
 #include "imu.h"
 #include "led.h"
+#include "material.h"
 #include "palette.h"
 #include "render.h"
 #include "sim.h"
@@ -31,6 +32,9 @@ static const char *TAG = "app";
 #define APP_TASK_CORE  1
 
 #define FRAME_US   (1000000 / TARGET_FPS)
+// Slack for frame-time jitter (1 ms ticks) when the sim times its publish.
+// 3 ms gave 99-100 % new frames in a timing model with 0.5-9.5 ms steps.
+#define SNAP_MARGIN_US 3000
 #define SIM_DT_US  (1000000 / SIM_HZ)
 
 #if APP_MODE == MODE_TEST_PATTERN
@@ -46,6 +50,7 @@ static const char *TAG = "app";
 #define SIM_TASK_PRIO  4   // below the IMU task (5) on the same core
 #define SIM_TASK_CORE  0
 static char s_mem_info[160]; // where the sand memory went, for the banner
+static const char *s_mode_name = "";
 #endif
 
 // Init results, reported in the banner.
@@ -74,6 +79,7 @@ static void print_banner(void)
     printf(" RGB LED   : %s, button: %s\n", esp_err_to_name(s_led_err), esp_err_to_name(s_btn_err));
 #if APP_MODE == MODE_SAND
     printf(" sand      : %s\n", s_mem_info);
+    printf(" look      : %s (BOOT long press cycles the sand-mode table)\n", s_mode_name);
     printf(" cores     : simulation on core %d, rendering on core %d\n", SIM_TASK_CORE, APP_TASK_CORE);
 #endif
     printf(" free heap : internal %u bytes, PSRAM %u bytes\n",
@@ -171,7 +177,7 @@ static void run_tilt_dot(void)
         // the screen-normal component.
         const float accel = 0.4f; // pixels/frame^2 per g
         float g_xy = sqrtf(imu.gx * imu.gx + imu.gy * imu.gy);
-        float glass = BACK_FRICTION * fabsf(imu.gz);
+        float glass = material_get(MATERIAL_CLASSIC)->glass_friction * fabsf(imu.gz);
         vx = (vx + imu.gx * accel) * 0.98f;
         vy = (vy + imu.gy * accel) * 0.98f;
         float sp = sqrtf(vx * vx + vy * vy);
@@ -240,6 +246,7 @@ typedef struct {
     uint8_t *buf[3];
     int front, ready, back;
     bool fresh; // `ready` holds a snapshot the renderer hasn't taken yet
+    int64_t last_take_us; // when the renderer last looked for a snapshot
 } snapshots_t;
 
 typedef struct {
@@ -259,6 +266,18 @@ static portMUX_TYPE s_snap_lock = portMUX_INITIALIZER_UNLOCKED;
 static sim_stats_t s_stats;
 static portMUX_TYPE s_stats_lock = portMUX_INITIALIZER_UNLOCKED;
 static bool s_respawn_req; // accessed with __atomic builtins
+// Sand-mode looks (palette + material); the render task picks one, the sim
+// task applies its material. Both accessed with __atomic builtins.
+static const sand_mode_t MODES[] = SAND_MODE_TABLE;
+#define MODE_COUNT ((int)(sizeof(MODES) / sizeof(MODES[0])))
+static int s_mode_req;
+
+static void apply_look(int mode)
+{
+    const sand_mode_t *md = &MODES[mode];
+    render_set_look(md->palette, material_get(md->material)->shade_spread);
+    s_mode_name = md->name;
+}
 
 static void *alloc_prefer_internal(size_t bytes, bool *internal)
 {
@@ -311,8 +330,10 @@ static esp_err_t sand_init(void)
     }
 
     sim_init(&s_sim, mem, GRID_W, GRID_H, n, esp_random());
+    sim_set_material(&s_sim, material_get(MODES[0].material));
     sim_spawn(&s_sim, SPAWN_REGION_FRACTION, PALETTE_SHADES);
-    render_init(PALETTE_DEFAULT);
+    render_init(MODES[0].palette);
+    apply_look(0);
     return ESP_OK;
 }
 
@@ -321,11 +342,21 @@ static void sim_task(void *arg)
     (void)arg;
     int64_t last = esp_timer_get_time();
     int64_t acc_us = 0;
+    int mode = 0;
 
     for (;;) {
         int64_t now = esp_timer_get_time();
         acc_us += now - last;
         last = now;
+
+        // Material follows the selected look; grains stay where they are.
+        int want_mode = __atomic_load_n(&s_mode_req, __ATOMIC_ACQUIRE);
+        if (want_mode != mode) {
+            if (MODES[want_mode].material != MODES[mode].material) {
+                sim_set_material(&s_sim, material_get(MODES[want_mode].material));
+            }
+            mode = want_mode;
+        }
 
         // Only if a single step costs more than SIM_DT_US can the backlog grow
         // without bound; then cap it (physics slows down) and report it.
@@ -346,8 +377,8 @@ static void sim_task(void *arg)
                 sim_spawn(&s_sim, SPAWN_REGION_FRACTION, PALETTE_SHADES);
             }
 
-            uint32_t steps = 0;
-            int64_t step_us = 0, max_us = 0;
+            uint32_t steps = 0, snaps = 0;
+            int64_t step_us = 0, max_us = 0, snap_us = 0;
             while (acc_us >= SIM_DT_US) {
                 int64_t t0 = esp_timer_get_time();
                 sim_step(&s_sim);
@@ -356,24 +387,34 @@ static void sim_task(void *arg)
                 max_us = dt > max_us ? dt : max_us;
                 acc_us -= SIM_DT_US;
                 steps++;
-            }
 
-            // Publish a snapshot if the renderer has taken the previous one.
-            bool want;
-            portENTER_CRITICAL(&s_snap_lock);
-            want = !s_snap.fresh;
-            portEXIT_CRITICAL(&s_snap_lock);
-            int64_t snap_us = 0;
-            if (want) {
-                int64_t t0 = esp_timer_get_time();
-                render_snapshot(&s_sim, s_snap.buf[s_snap.back]);
-                snap_us = esp_timer_get_time() - t0;
+                // Hand the newest state to the next frame. Publish after this
+                // step if the renderer's next frame comes before another step
+                // can finish (so the frame gets the latest state), or if the
+                // renderer took the last snapshot and its frame is already due
+                // (safety net). Normally that is one snapshot per frame, built
+                // from the last step before the frame. (Publishing only at the
+                // end of a batch left frames without new data whenever long
+                // steps made the sim run two steps back to back.)
+                bool want;
+                int64_t now_us = esp_timer_get_time();
+                int64_t next_step_done = now_us + (dt > SIM_DT_US ? dt : SIM_DT_US);
                 portENTER_CRITICAL(&s_snap_lock);
-                int t = s_snap.back;
-                s_snap.back = s_snap.ready;
-                s_snap.ready = t;
-                s_snap.fresh = true;
+                int64_t due = s_snap.last_take_us + FRAME_US;
+                want = next_step_done > due - SNAP_MARGIN_US || (!s_snap.fresh && now_us >= due - SNAP_MARGIN_US);
                 portEXIT_CRITICAL(&s_snap_lock);
+                if (want) {
+                    int64_t t1 = esp_timer_get_time();
+                    render_snapshot(&s_sim, s_snap.buf[s_snap.back]);
+                    snap_us += esp_timer_get_time() - t1;
+                    snaps++;
+                    portENTER_CRITICAL(&s_snap_lock);
+                    int t = s_snap.back;
+                    s_snap.back = s_snap.ready;
+                    s_snap.ready = t;
+                    s_snap.fresh = true;
+                    portEXIT_CRITICAL(&s_snap_lock);
+                }
             }
 
             portENTER_CRITICAL(&s_stats_lock);
@@ -381,7 +422,7 @@ static void sim_task(void *arg)
             s_stats.step_us += step_us;
             s_stats.max_step_us = max_us > s_stats.max_step_us ? max_us : s_stats.max_step_us;
             s_stats.snap_us += snap_us;
-            s_stats.snaps += want;
+            s_stats.snaps += snaps;
             s_stats.lost_us += lost;
             s_stats.awake = s_sim.awake;
             s_stats.motion = s_sim.motion;
@@ -403,6 +444,10 @@ static void run_sand(void)
     int frames = 0, new_frames = 0;
     int64_t render_us = 0, wait_us = 0;
 
+    // Mode-name overlay: shown at boot and after every look change.
+    int64_t overlay_t0 = esp_timer_get_time();
+    int overlay_mode = 0;
+
     xTaskCreatePinnedToCore(sim_task, "sim", SIM_TASK_STACK, NULL, SIM_TASK_PRIO, NULL, SIM_TASK_CORE);
 
     for (;;) {
@@ -413,12 +458,20 @@ static void run_sand(void)
             ESP_LOGI(TAG, "respawn");
         }
         if (ev & BUTTON_EVT_LONG) {
-            render_set_palette(render_palette() + 1);
-            ESP_LOGI(TAG, "palette: %s", palette_get(render_palette())->name);
+            int mode = (__atomic_load_n(&s_mode_req, __ATOMIC_ACQUIRE) + 1) % MODE_COUNT;
+            apply_look(mode);
+            __atomic_store_n(&s_mode_req, mode, __ATOMIC_RELEASE);
+            ESP_LOGI(TAG, "mode: %s (palette %s, material %s)", MODES[mode].name,
+                     palette_get(MODES[mode].palette)->name, material_get(MODES[mode].material)->name);
+            overlay_t0 = esp_timer_get_time();
+            overlay_mode = mode;
         }
 
-        // Take the newest snapshot, if there is one.
+        // Take the newest snapshot, if there is one, and tell the sim when
+        // this frame took it (it times its next publish for the next frame).
+        int64_t take_us = esp_timer_get_time();
         portENTER_CRITICAL(&s_snap_lock);
+        s_snap.last_take_us = take_us;
         bool got = s_snap.fresh;
         if (got) {
             int t = s_snap.front;
@@ -433,6 +486,15 @@ static void run_sand(void)
         display_wait();
         int64_t t1 = esp_timer_get_time();
         render_frame(s_snap.buf[s_snap.front], fb);
+        int64_t shown_ms = (t1 - overlay_t0) / 1000;
+        if (shown_ms < OVERLAY_HOLD_MS + OVERLAY_FADE_MS) {
+            float alpha = shown_ms < OVERLAY_HOLD_MS
+                              ? 1.0f
+                              : 1.0f - (float)(shown_ms - OVERLAY_HOLD_MS) / (float)OVERLAY_FADE_MS;
+            const sand_mode_t *md = &MODES[overlay_mode];
+            render_overlay(fb, material_get(md->material)->name, palette_brightest(palette_get(md->palette)),
+                           alpha);
+        }
         display_push_async();
         int64_t t2 = esp_timer_get_time();
 

@@ -7,10 +7,21 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "config.h"
+
 typedef struct {
     float x, y;     // position in cell units; the grain occupies cell (int)x, (int)y
     float vx, vy;   // velocity in cells per step
 } sim_grain_t;
+
+// One line of cells along the gravity direction (water levelling).
+typedef struct {
+    int16_t top_x, top_y; // topmost grain, or one past the far end if empty
+    int16_t lat;          // position across gravity, for the range limit
+    int16_t source;       // top grain may be moved (resting water)
+    float pot_top;        // height of the top grain along true "up"
+    float pot_spot;       // height of the free cell above it (FLT_MAX if none)
+} sim_column_t;
 
 typedef struct {
     int w, h;            // grid size in cells
@@ -19,15 +30,27 @@ typedef struct {
     uint8_t *shade;      // per grain, 0..n_shades-1
     uint16_t *cell;      // w*h, grain index + 1, 0 = empty
     uint8_t *idle;       // per grain: steps without moving; >= SLEEP_STEPS = asleep
+    sim_column_t *cols;  // w + h entries, scratch for water levelling
+
+    // Active material and values derived from it (sim_set_material).
+    const material_t *mat;
+    float rest_speed2;   // rest_speed^2
+    float damp_keep;     // 1 - damping
+    float token;         // rule_token * rest_speed
+    int wake_radius;     // material wake_radius, or WAKE_RADIUS
 
     // Derived from the last sim_set_gravity() call.
     float ax, ay;        // in-plane acceleration, cells/step^2
     float friction;      // Coulomb friction against the screen face, cells/step^2
     int down;            // snapped gravity direction 0..7, or -1 if the sand is held by friction
-    float repose_tan[2]; // tan of slide threshold toward lateral side -1 / +1
-    float repose_prob;   // chance per step that a resting grain tries the repose rule
+    float repose_tan[2]; // REPOSE: tan of slide threshold toward lateral side -1 / +1
+    float tilt_tan[2];   // SPREAD: height lost per lateral cell toward side -1 / +1
+    float up_x, up_y;    // unit vector opposite to in-plane gravity (water levelling)
+    float rule_prob;     // chance per step that a resting grain applies its rule
+    float last_g[3];     // last gravity input
     float ref_g[3];      // gravity when grains were last woken (see sim_set_gravity)
     int ref_down;
+    float wake_cos;      // cos(WAKE_ANGLE_DEG)
 
     uint32_t rng;
     uint32_t steps;
@@ -35,6 +58,17 @@ typedef struct {
     float motion_acc;    // running sum during a step
     int awake;           // grains that were updated (not asleep) in the last step
     int sleeping;        // grains currently asleep
+    // Diagnostics (running totals; never affect the physics).
+    uint32_t n_wake_all;  // wake-everyone events (gravity, shake, material, spawn)
+    uint32_t n_wake_exposed; // water: gravity changes that woke only exposed grains
+    uint32_t moves;       // grains that changed cell (running total)
+    // Water levelling bookkeeping: skip the pass while nothing can change.
+    uint32_t level_seen_moves;
+    int level_settled;    // last pass found the surface level
+    float level_up_x, level_up_y; // gravity direction of that pass
+    float level_recheck_cos;      // cos(LEVEL_RECHECK_DEG)
+    uint32_t n_transfers; // water levelling moves
+    uint32_t n_pushes;    // water spread pushes
 } sim_t;
 
 // Bytes of working memory sim_init() needs for a w x h grid with n grains.
@@ -50,6 +84,10 @@ void sim_spawn(sim_t *s, float region, int n_shades);
 
 // Gravity in g, screen frame: x right, y down, z out of the screen.
 void sim_set_gravity(sim_t *s, float gx, float gy, float gz);
+
+// Switch material; every grain stays where it is and is woken. sim_init()
+// starts with MATERIAL_CLASSIC.
+void sim_set_material(sim_t *s, const material_t *m);
 
 // Kick every grain: directional part along (dir_x, dir_y) (any length, it is
 // normalised; zero for none) plus an isotropic random part, both scaled by
