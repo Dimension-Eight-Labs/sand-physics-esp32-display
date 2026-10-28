@@ -1,4 +1,4 @@
-// Idle dimming detector; see idle.h.
+// Idle dimming and auto-off detector; see idle.h.
 #include "idle.h"
 
 #include <math.h>
@@ -62,5 +62,15 @@ float idle_dim_amount(int64_t idle_us)
 #else
     (void)idle_us;
     return 0.0f;
+#endif
+}
+
+bool idle_auto_off(int64_t idle_us)
+{
+#if AUTO_OFF_ENABLE
+    return idle_us >= (int64_t)AUTO_OFF_S * 1000000;
+#else
+    (void)idle_us;
+    return false;
 #endif
 }

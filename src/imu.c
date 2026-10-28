@@ -24,7 +24,18 @@ static const char *TAG = "imu";
 #define REG_CTRL2    0x03 // accel full scale (bits 6:4) + ODR (bits 3:0)
 #define REG_CTRL5    0x06 // on-chip low-pass filters
 #define REG_CTRL7    0x08 // sensor enable
+#define REG_CTRL9    0x0A // host commands
+#define REG_CAL1_L   0x0B
+#define REG_CAL1_H   0x0C
+#define REG_STATUSINT 0x2D
+#define REG_STATUS1  0x2F
 #define REG_AX_L     0x35
+#define REG_RESET    0x60
+
+#define CTRL1_INT2_EN   0x10 // INT2 output enabled (later datasheet revisions; reserved in rev 0.6)
+#define CMD_WRITE_WOM   0x08 // CTRL9: apply the CAL1 wake-on-motion settings
+#define CMD_ACK         0x00
+#define ACC_FS_4G       0x01
 
 #define WHO_AM_I_VAL 0x05
 #define ACC_FS_8G    0x02 // CTRL2 aFS
@@ -37,7 +48,8 @@ static const char *TAG = "imu";
 // budget, rendering uses a small part of each frame.
 #define IMU_TASK_CORE  1
 
-static SemaphoreHandle_t s_ready; // imu_task -> imu_init: setup finished
+static SemaphoreHandle_t s_ready; // imu_task -> imu_init: setup finished; -> imu_stop: stopped
+static bool s_stop_req;           // accessed with __atomic builtins
 static esp_err_t s_init_err = ESP_FAIL;
 static i2c_master_bus_handle_t s_bus;
 static i2c_master_dev_handle_t s_dev;
@@ -80,6 +92,10 @@ static void imu_task(void *arg)
 
     for (;;) {
         xTaskDelayUntil(&last, period);
+        if (__atomic_load_n(&s_stop_req, __ATOMIC_ACQUIRE)) {
+            xSemaphoreGive(s_ready);
+            vTaskDelete(NULL);
+        }
 
         uint8_t b[6];
         if (reg_read(REG_AX_L, b, sizeof(b)) != ESP_OK) {
@@ -147,9 +163,45 @@ void imu_get(imu_state_t *out, bool consume)
     portEXIT_CRITICAL(&s_lock);
 }
 
-// Bus, probe and sensor configuration. Runs in the IMU task, so the I2C
-// interrupt is installed on that task's core (see IMU_TASK_CORE).
-static esp_err_t imu_setup(void)
+// CTRL9 command handshake. The datasheet revisions differ: rev 0.6 sets
+// STATUS1 bit 0 when done and clears it when STATUS1 is read; later ones set
+// STATUSINT bit 7 and want CMD_ACK written to CTRL9. Both are handled.
+static esp_err_t ctrl9(uint8_t cmd)
+{
+    ESP_RETURN_ON_ERROR(reg_write(REG_CTRL9, cmd), TAG, "CTRL9");
+    esp_err_t done = ESP_ERR_TIMEOUT;
+    for (int i = 0; i < 100 && done != ESP_OK; i++) {
+        uint8_t si = 0, s1 = 0;
+        if (reg_read(REG_STATUSINT, &si, 1) == ESP_OK && reg_read(REG_STATUS1, &s1, 1) == ESP_OK &&
+            ((si & 0x80) || (s1 & 0x01))) {
+            done = ESP_OK;
+        } else {
+            vTaskDelay(pdMS_TO_TICKS(1));
+        }
+    }
+    reg_write(REG_CTRL9, CMD_ACK);
+    vTaskDelay(pdMS_TO_TICKS(1));
+    uint8_t s1;
+    reg_read(REG_STATUS1, &s1, 1); // clears CmdDone (rev 0.6)
+    return done;
+}
+
+// Leave wake-on-motion (the sensor stays powered through deep sleep and may
+// still be in it), the datasheet's exit sequence, then a soft reset.
+static void leave_wake_on_motion(void)
+{
+    reg_write(REG_CTRL7, 0x00);
+    reg_write(REG_CAL1_L, 0x00);
+    reg_write(REG_CAL1_H, 0x00);
+    if (ctrl9(CMD_WRITE_WOM) != ESP_OK) {
+        ESP_LOGW(TAG, "no CTRL9 acknowledge leaving wake-on-motion");
+    }
+    reg_write(REG_RESET, 0xB0);
+    vTaskDelay(pdMS_TO_TICKS(20));
+}
+
+// I2C bus, probe (main address, then the alternative) and device handle.
+static esp_err_t open_device(void)
 {
     const i2c_master_bus_config_t bus_cfg = {
         .i2c_port = -1,
@@ -178,6 +230,16 @@ static esp_err_t imu_setup(void)
     s_info.found = true;
     s_info.addr = addr;
 
+    return ESP_OK;
+}
+
+// Bus, probe and sensor configuration. Runs in the IMU task, so the I2C
+// interrupt is installed on that task's core (see IMU_TASK_CORE).
+static esp_err_t imu_setup(void)
+{
+    ESP_RETURN_ON_ERROR(open_device(), TAG, "device");
+
+    leave_wake_on_motion();
     uint8_t who = 0;
     ESP_RETURN_ON_ERROR(reg_read(REG_WHO_AM_I, &who, 1), TAG, "WHO_AM_I");
     s_info.who_am_i = who;
@@ -198,7 +260,7 @@ static esp_err_t imu_setup(void)
     ESP_RETURN_ON_ERROR(reg_write(REG_CTRL7, 0x43), TAG, "CTRL7");
     vTaskDelay(pdMS_TO_TICKS(20));
 
-    ESP_LOGI(TAG, "QMI8658 at 0x%02X, WHO_AM_I 0x%02X, +/-8 g", addr, who);
+    ESP_LOGI(TAG, "QMI8658 at 0x%02X, WHO_AM_I 0x%02X, +/-8 g", s_info.addr, who);
     return ESP_OK;
 }
 
@@ -220,4 +282,67 @@ esp_err_t imu_init(void)
         return ESP_ERR_TIMEOUT;
     }
     return s_init_err;
+}
+
+static void stop_task(void)
+{
+    if (s_init_err != ESP_OK || __atomic_load_n(&s_stop_req, __ATOMIC_ACQUIRE)) {
+        return;
+    }
+    __atomic_store_n(&s_stop_req, true, __ATOMIC_RELEASE);
+    xSemaphoreTake(s_ready, pdMS_TO_TICKS(100));
+}
+
+esp_err_t imu_wake_on_motion(uint8_t threshold_mg, uint8_t odr, uint8_t blanking)
+{
+    if (!s_dev) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    stop_task();
+    // Datasheet section 9.4: sensors off, accelerometer rate and range, WoM
+    // threshold and interrupt (INT2, idle high, so the event drives it low),
+    // CTRL9 command, accelerometer on (alone, so low-power rates apply).
+    ESP_RETURN_ON_ERROR(reg_write(REG_CTRL7, 0x00), TAG, "CTRL7");
+    ESP_RETURN_ON_ERROR(reg_write(REG_CTRL2, (ACC_FS_4G << 4) | (odr & 0x0F)), TAG, "CTRL2");
+    ESP_RETURN_ON_ERROR(reg_write(REG_CAL1_L, threshold_mg), TAG, "CAL1_L");
+    ESP_RETURN_ON_ERROR(reg_write(REG_CAL1_H, (uint8_t)(0xC0 | (blanking & 0x3F))), TAG, "CAL1_H");
+    ESP_RETURN_ON_ERROR(ctrl9(CMD_WRITE_WOM), TAG, "WoM command");
+    uint8_t ctrl1 = 0;
+    ESP_RETURN_ON_ERROR(reg_read(REG_CTRL1, &ctrl1, 1), TAG, "CTRL1");
+    ESP_RETURN_ON_ERROR(reg_write(REG_CTRL1, (uint8_t)((ctrl1 & 0xFE) | CTRL1_INT2_EN)), TAG, "CTRL1");
+    ESP_RETURN_ON_ERROR(reg_write(REG_CTRL7, 0x01), TAG, "CTRL7");
+    vTaskDelay(pdMS_TO_TICKS(5));
+    uint8_t s1;
+    return reg_read(REG_STATUS1, &s1, 1); // INT2 back to its idle level
+}
+
+esp_err_t imu_clear_wake_on_motion(void)
+{
+    if (!s_dev) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    uint8_t s1;
+    return reg_read(REG_STATUS1, &s1, 1);
+}
+
+esp_err_t imu_rearm_wake_on_motion(void)
+{
+    // A brief wake (no task, no reconfiguration): the sensor is still in
+    // wake-on-motion from before; only the interrupt line is reset.
+    ESP_RETURN_ON_ERROR(open_device(), TAG, "device");
+    return imu_clear_wake_on_motion();
+}
+
+esp_err_t imu_power_down(void)
+{
+    if (!s_dev) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    stop_task();
+    // Datasheet "Power-Down": sensors off, internal oscillator off (about
+    // 20 uA). Register values are kept; the next imu_init() resets it.
+    ESP_RETURN_ON_ERROR(reg_write(REG_CTRL7, 0x00), TAG, "CTRL7");
+    uint8_t ctrl1 = 0;
+    ESP_RETURN_ON_ERROR(reg_read(REG_CTRL1, &ctrl1, 1), TAG, "CTRL1");
+    return reg_write(REG_CTRL1, (uint8_t)(ctrl1 | 0x01));
 }

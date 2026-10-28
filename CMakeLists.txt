@@ -8,5 +8,8 @@ cmake_minimum_required(VERSION 3.16.0)
 if(RELEASE_BUILD)
     set(SDKCONFIG_DEFAULTS "${CMAKE_CURRENT_LIST_DIR}/sdkconfig.defaults;${CMAKE_CURRENT_LIST_DIR}/sdkconfig.defaults.release")
 endif()
+# Re-run the configure step whenever version.txt changes; otherwise an
+# incremental build keeps the version it was first configured with.
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${CMAKE_CURRENT_LIST_DIR}/version.txt")
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 project(sand_physics)

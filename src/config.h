@@ -18,6 +18,7 @@
 #define MODE_TEST_PATTERN 0   // colour bars + border: check offset/orientation/colour
 #define MODE_TILT_DOT     1   // one rolling dot + raw accel log: check IMU mapping
 #define MODE_SAND         2   // the full demo
+#define MODE_LED_CAL      3   // palette swatch + candidate LED colours: match the RGB LED to the screen
 
 #ifndef APP_MODE
 #define APP_MODE MODE_SAND
@@ -297,6 +298,24 @@ typedef struct {
 
 // ---- LED / backlight ---------------------------------------------------------
 #define BACKLIGHT_PERCENT 90
+// RGB LED colour per palette, chosen to look like the screen's colour, not
+// copied from it: the WS2812's green is bluer and far brighter than the
+// panel's. Gamma-encoded 0xRRGGBB like a screen colour; the driver linearises
+// each channel with LED_GAMMA before scaling brightness. Find better values
+// with the ledcal environment (README "Matching the LED colour").
+#define LED_COLOR_GREEN  0x2DFF00
+#define LED_COLOR_ORANGE 0xFF9C00
+#define LED_GAMMA         2.2f
+
+// ledcal environment: candidates around the palette's LED_COLOR_*, in the
+// gamma-encoded HSV space: hue -/+ LEDCAL_HUE_STEPS x LEDCAL_HUE_STEP_DEG,
+// saturation lowered in LEDCAL_SAT_STEPS steps of LEDCAL_SAT_STEP. Shown at
+// LED level LEDCAL_LEVEL (0..255, as LED_MAX_LEVEL).
+#define LEDCAL_HUE_STEP_DEG 3.0f
+#define LEDCAL_HUE_STEPS    5
+#define LEDCAL_SAT_STEP     0.1f
+#define LEDCAL_SAT_STEPS    4
+#define LEDCAL_LEVEL        LED_MAX_LEVEL
 // LED brightness (0..255) when the sand is still / at full motion.
 #define LED_MIN_LEVEL     6
 #define LED_MAX_LEVEL     90
@@ -322,6 +341,75 @@ typedef struct {
 // Total sand motion (sum of grain speeds, cells/step) that counts as moving.
 #define IDLE_WAKE_MOTION           20.0f
 
+// ---- Battery ------------------------------------------------------------------------
+// BAT -> R1 200K / R4 100K (1 %) -> BAT_ADC (GPIO1, ADC1 channel 0), so the
+// ADC sees a third of the battery voltage. Read once per BAT_SAMPLE_MS on
+// core 1 (BAT_ADC_SAMPLES conversions averaged), calibrated by ESP-IDF's
+// curve-fitting scheme, then smoothed (BAT_FILTER_S time constant).
+// BAT_ADC_SCALE corrects the divider; 1.0072 is the correction Waveshare's own
+// demo applies (BAT_Driver.c: / 0.992857). Measure the cell with a meter and
+// compare with the banner / stats line to refine it.
+#define BAT_SAMPLE_MS      1000
+#define BAT_ADC_SAMPLES    16
+#define BAT_DIVIDER        3.0f
+#define BAT_ADC_SCALE      1.0072f
+#define BAT_FILTER_S       60.0f
+// The shown percent follows the filtered reading down once it is
+// BAT_HYST_PERCENT below, but up only after BAT_RISE_PERCENT (on battery the
+// charge only falls; a cell recovers a little when the load drops). The
+// 5-bar level needs BAT_HYST_PERCENT past a bar boundary to change.
+#define BAT_HYST_PERCENT   2
+#define BAT_RISE_PERCENT   10
+// Above this the cell is on the charger (or there is no cell and the charger
+// output is read): the level is not meaningful, the OSD animates instead.
+// The board cannot sense USB or the charger's STAT pin, so this is the only
+// hint; a cell fresh off the charger can sit just below it for a while.
+// A cell charging from part full stays below it until near the end of the
+// charge, so "charging" really means "on USB with the cell (nearly) full, or
+// no cell". BAT_CHARGING_HYST_MV keeps it from flickering.
+#define BAT_CHARGING_MV      4190
+#define BAT_FAST_FILTER_S    5.0f
+#define BAT_CHARGING_HYST_MV 30
+// Below this the reading is not a battery (no cell and no USB cannot happen
+// while running; this catches a broken divider or ADC read).
+#define BAT_VALID_MIN_MV   2500
+
+// Battery OSD (BOOT double click): an icon with 5 bars (20 % each) for
+// BAT_OSD_MS, the last BAT_OSD_FADE_MS of it fading out. While charging the
+// bars climb one by one every BAT_OSD_CHARGE_STEP_MS.
+#define BAT_OSD_MS             3000
+#define BAT_OSD_FADE_MS        400
+#define BAT_OSD_CHARGE_STEP_MS 300
+
+// Low battery: below BAT_LOW_PERCENT (and not charging) the LED blinks red
+// instead of the palette pulse; it stops above BAT_LOW_PERCENT +
+// BAT_HYST_PERCENT. On for BAT_LOW_BLINK_ON_MS every BAT_LOW_BLINK_MS.
+#define BAT_LOW_ENABLE      1
+#define BAT_LOW_PERCENT     15
+#define BAT_LOW_BLINK_MS    1000
+#define BAT_LOW_BLINK_ON_MS 150
+#define BAT_LOW_COLOR       0xFF0000
+
+// Low-voltage cutoff: when the cell (60 s filtered, under load) falls below
+// BAT_CUTOFF_MV, the empty battery icon blinks for BAT_CUTOFF_WARN_MS, the
+// picture collapses and the board sleeps with motion wake off (only BOOT and
+// RESET wake it). Every boot checks a settled reading first: below the
+// cutoff (plus BAT_CUTOFF_RESUME_MV after a cutoff, since a rested cell reads
+// higher than one under load) it shows the warning and sleeps again. Not
+// applied while the board appears to be on USB (reading above
+// BAT_CHARGING_MV, or a USB host connected to the serial port).
+#define BAT_CUTOFF_ENABLE    1
+#define BAT_CUTOFF_MV        3300
+#define BAT_CUTOFF_RESUME_MV 100
+#define BAT_CUTOFF_WARN_MS   2000
+#define BAT_CUTOFF_BLINK_MS  400  // icon on half of this, off half
+
+// Drain log: settled reading for the voltage stored at power-off and read at
+// wake, BAT_SETTLED_SAMPLES conversions after discarding a few and waiting
+// BAT_SETTLE_MS.
+#define BAT_SETTLED_SAMPLES  64
+#define BAT_SETTLE_MS        20
+
 // ---- Logging ---------------------------------------------------------------------
 // Once-a-second statistics line on the console (sand mode). Off in the release
 // environment (RELEASE_BUILD); build with -DSTATS_LOG=1 to turn it back on.
@@ -333,5 +421,66 @@ typedef struct {
 #endif
 #endif
 
-// ---- Button --------------------------------------------------------------------------
-#define BTN_LONG_MS 700
+// ---- Button (BOOT) --------------------------------------------------------------------
+// Gestures (src/gesture.c, checked by tools/sim_power.c):
+//   click         press shorter than BTN_LONG_MS, no second press within
+//                 BTN_DOUBLE_MS of the release: respawn (fires when the
+//                 window has passed, so it is never the start of a double)
+//   double click  two such presses, the second starting within BTN_DOUBLE_MS
+//                 of the first release (fires on the second release)
+//   long press    released between BTN_LONG_MS and BTN_HOLD_SHOW_MS: next mode
+//                 (fires on release, so a hold never changes the mode first)
+//   hold          from BTN_HOLD_SHOW_MS a progress bar fills; releasing then
+//                 cancels with no action; reaching BTN_POWER_OFF_MS powers off
+//                 (fires while still held)
+// A click followed by a long press or hold counts only as the long press /
+// hold. A press already down at boot (the one that woke the board) is
+// ignored until released.
+#define BTN_DOUBLE_MS    300
+#define BTN_LONG_MS      1000
+#define BTN_HOLD_SHOW_MS 1500
+#define BTN_POWER_OFF_MS 3000
+
+// ---- Power ------------------------------------------------------------------------------
+// Power off = CRT collapse animation, backlight off, LCD controller to sleep,
+// LED dark, QMI8658 to wake-on-motion, ESP32-S3 deep sleep. Wakes on a BOOT
+// press, on RESET, or on motion (QMI8658 INT2 -> GPIO12). The current mode
+// is kept in RTC memory across the sleep (not across RESET or power loss).
+//
+// Auto-off: no activity (the idle-dimming definition above: a knock, a real
+// tilt, sand still moving, a button press) for AUTO_OFF_S powers off.
+#define AUTO_OFF_ENABLE 1
+#define AUTO_OFF_S      (15 * 60)
+
+// Wake on motion: the QMI8658 runs its accelerometer alone in low-power mode
+// and toggles INT2 when the motion it sees exceeds the threshold (datasheet:
+// "absolute value in mg", 1 mg per step, 1..255; how it is measured is not
+// documented). 150 mg at 11 Hz is meant to ignore light desk bumps and wake
+// on a pick-up or a tilt; a starting value, tune on hardware.
+#define WOM_ENABLE       1
+#define WOM_THRESHOLD_MG 150
+// Low-power accelerometer rate (CTRL2 aODR): 0x0C = 128 Hz, 0x0D = 21 Hz,
+// 0x0E = 11 Hz, 0x0F = 3 Hz (datasheet: 55 / 42 / 35 / 30 uA).
+#define WOM_ODR          0x0E
+// Samples ignored after entering wake-on-motion (settling), 0..63.
+#define WOM_BLANKING     8
+// Motion wake is armed this long after power-off (until then only BOOT and
+// RESET wake the board), so setting the board down after a hold-to-off does
+// not wake it straight away. The chip wakes briefly on a timer to arm it
+// (no display, no LED; about a quarter of a second).
+#define WOM_ARM_DELAY_S  10
+
+// LED data line in deep sleep. The board pulls it up to 3V3 through 10 kOhm
+// (schematic R21), so holding it low would draw 330 uA for the whole sleep.
+// 0: hold it high (no current; the LED latches nothing without a low reset
+// pulse), 1: hold it low.
+#define SLEEP_LED_DATA_LOW 0
+
+// CRT power animations (ms). Off: the picture squeezes vertically into a
+// bright line, the line shrinks to a dot, the dot fades. On: the mirror.
+#define CRT_OFF_SQUEEZE_MS 300
+#define CRT_OFF_SHRINK_MS  200
+#define CRT_OFF_FADE_MS    200
+#define CRT_ON_DOT_MS      150
+#define CRT_ON_LINE_MS     200
+#define CRT_ON_OPEN_MS     300

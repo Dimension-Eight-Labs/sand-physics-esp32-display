@@ -41,7 +41,7 @@ All values live in `src/board.h`, each with a citation. Sources:
 | IMU | QMI8658, I2C SDA GPIO48, SCL GPIO47, 400 kHz | [IDF-DEMO] `I2C_Driver.h`, [ARD-DEMO], [SCH] `IMU_SDA/IMU_SCL` |
 | IMU address | 0x6B (SA0 tied low), WHO_AM_I 0x05 | [IDF-DEMO] `QMI8658_L_SLAVE_ADDRESS`, [SCH] SA0 → GND; **confirmed on hardware** (0x05 at 0x6B) |
 | IMU axes → screen | X = −chip X, Y = +chip Y, Z = chip Z (screen normal) | **hardware test** (§6); Y and Z confirmed, X sign flipped and to be re-checked |
-| RGB LED | 1× WS2812B-0807 on GPIO38, GRB order | [SCH] `LED2 WS2812B-0807`, `RGB_IO`=IO38; [IDF-DEMO] `led_strip`, [ARD-DEMO] `neopixelWrite`; **colour order confirmed on hardware** (pure red shows red) |
+| RGB LED | 1× WS2812B-0807 on GPIO38, byte order `BOARD_RGB_ORDER_RGB` (now RGB) | [SCH] `LED2 WS2812B-0807`, `RGB_IO`=IO38; [IDF-DEMO] `led_strip`, [ARD-DEMO] `neopixelWrite` (both GRB defaults, both only show a rainbow). Early bring-up reported pure red as red with GRB; 1.1.0 ledcal showed green 0x47FF00 (sent G90 R5) as red, i.e. the LED takes the first byte as red: switched to RGB. ledcal's start-up red/green/blue check settles it |
 | BOOT button | GPIO0, active low | [IDF-DEMO] `BOOT_KEY_PIN 0` |
 | Console | Native USB (USB-Serial-JTAG), no UART bridge | [SCH] USB D+/D− on IO19/IO20; **confirmed on hardware** (banner and WHO_AM_I received) |
 
@@ -911,6 +911,93 @@ suite (`sim_liquidfx`, `sim_liquidstab`, `sim_liquid`) and the sand suite
   `flasher_args.json` (0x0 bootloader, 0x8000 partition table, 0x10000 app;
   DIO, 80 MHz, 16 MB) into `dist/sand-physics-<version>.bin`, flashed at 0x0.
 
+## Power 1.1.0 (2026-10-28)
+
+No physics or material changes: every host suite (`sim_golden`, `sim_host`,
+`sim_hand`, `sim_liquid`, `sim_liquidfx`, `sim_liquidstab`, `sim_sandfx`,
+`sim_idle`) gives output identical to 1.0.0 apart from host timing columns.
+
+- **Hardware checked against the schematic** (`[SCH]`): QMI8658 INT1 (pin 4)
+  → `IMU_INT1` → IO13, INT2 (pin 9) → `IMU_INT2` → IO12; BOOT (Key2) to GND
+  with R10 10K pull-up on IO0; RESET (Key1) on CHIP_PU. The LED data net
+  `RGB_IO` has a 10K pull-up R21 to 3V3; the LED's VDD is 3V3, unswitched.
+  Power path: BAT → AO3401 → VSYS (VBUS → MBR230LSF → VSYS) → ME6217C33
+  (EN tied to VSYS) → 3V3; divider R1 200K / R4 100K from BAT to IO1.
+  Backlight: GPIO46 → 1K → SI2302 gate with 10K pull-down. Flash and PSRAM
+  on VDD_SPI. Neither Waveshare demo uses the IMU interrupts.
+- **Gestures** (`src/gesture.c`, hardware-free, debouncing included): click
+  (fires `BTN_DOUBLE_MS` after release), double click, long press (fires on
+  release between `BTN_LONG_MS` and `BTN_HOLD_SHOW_MS`), hold (bar from
+  `BTN_HOLD_SHOW_MS`, release cancels, `BTN_POWER_OFF_MS` powers off while
+  held). A press down at boot is ignored until released. `tools/sim_power.c`
+  checks 19 scripted sequences with random contact bounce and sweeps press
+  length and gap.
+- **Power off** (`src/power.c`): CRT collapse (`render_crt()`; squeeze 300
+  ms, line → dot 200 ms, fade 200 ms), then `led_sleep()` (RMT released, data
+  held high: no current against R21, nothing latched), `display_sleep()`
+  (DISPOFF, SLPIN, bus and control pins held), QMI8658 wake-on-motion
+  (datasheet §9.4: CTRL7 = 0, CTRL2 = ±4 g / 11 Hz low-power, CAL1_L =
+  threshold mg, CAL1_H = INT2 idle-high + blanking, CTRL9 0x08, CTRL1 INT2
+  enable, CTRL7 = accel only), wait for BOOT up, deep sleep with ext1
+  (ANY_LOW) on GPIO0 and a `WOM_ARM_DELAY_S` timer. The timer wake (no
+  display, no LED) resets INT2 and sleeps again with GPIO0 + GPIO12. Mode
+  saved in `RTC_DATA_ATTR` memory (magic-checked; used only after a
+  deep-sleep wake). `imu_init()` leaves wake-on-motion (datasheet §9.6) and
+  soft-resets the sensor on every boot.
+- **GPIO0 wake.** Strapping pins are latched at system / chip reset only;
+  a deep-sleep wake is a core reset (TRM table 7-1), so a BOOT press is a
+  safe wake source. The ext1 pins are returned from the RTC mux at boot.
+- **Auto-off**: `idle_auto_off()` on the idle-dimming activity time.
+- **LED colour**: per-palette `LED_COLOR_*` (plain 0xRRGGBB), maths in
+  `src/ledcolor.c`: adjustments in gamma-encoded HSV, then `LED_GAMMA` once
+  per channel, then brightness (pulse, dimming, animation) scales the linear
+  channels together. Channel order is only the driver's
+  `color_component_format`, from `BOARD_RGB_ORDER_RGB`. `env:ledcal`
+  (`MODE_LED_CAL`) starts with a 1 s red / green / blue check, then steps
+  candidates.
+
+## Battery (2026-10-28)
+
+No physics changes; every host suite identical (timing columns aside).
+
+- **Hardware checked against `[SCH]`**: BAT → R1 200K 1 % → `BAT_ADC` → R4
+  100K 1 % → GND, C8 100nF on BAT_ADC; GPIO table "IO1 BAT_ADC"; `[IDF-DEMO]`
+  `BAT_Driver.h`: ADC1 channel 0, × 3, / 0.992857. The divider is on BAT,
+  before the AO3401, so it reads the cell (or the charger output, with no
+  cell) on USB too. ETA6098 STAT → LED1 (via R3 3K) only; VBUS → D1, the
+  AO3401 gate network (R7 1K / R6 100K) and the header, no GPIO.
+- `src/battery.c`: ADC oneshot, 6 dB, curve-fitting calibration, 16
+  conversions per reading, task priority 1 on core 1, once per second.
+- `src/batt.c` (hardware-free, `tools/sim_battery.c`): EMA (60 s, started as
+  a running mean), LiPo curve (5 % table, 3.27–4.20 V), shown percent
+  follows down at −2 %, up at +10 % (2 % while settling), 5 bars with 2 %
+  boundary hysteresis, low flag below 15 % / off at 17 %, charging hint from
+  a 5 s EMA above 4190 mV (off below 4160 mV). Under ±40 mV noise the shown
+  level changes at most twice in 10 min at any fixed voltage and never rises
+  during a 3 h discharge.
+- OSD (`render_battery()`): vertical icon 64 × 128 px with nub, 5 bars,
+  1-px halo, unlit slots at 8 %, black backing box; 3 s, last 0.4 s fading;
+  charging: 0..5 bars cycling every 0.3 s. Low battery: LED red 150 ms every
+  1 s instead of the pulse.
+
+## 1.2.0: cutoff and drain log (2026-10-28)
+
+- **Cutoff** (`BAT_CUTOFF_*`): running, the 60 s filtered reading (after 10
+  readings) below 3300 mV and not on USB → empty icon blinking 2 s + LED red,
+  CRT collapse, `power_off(POWER_OFF_CUTOFF)`: QMI8658 to power-down (no
+  wake-on-motion, no arming timer), ext1 on BOOT only. Every boot in the sand
+  modes checks the settled boot reading (taken before the backlight is on)
+  against 3300 mV, or 3400 mV after a cutoff; below: warning over black,
+  line/dot collapse, sleep again. "On USB" = charging hint (> 4190 mV) or
+  `usb_serial_jtag_is_connected()`, checked after the warning so a host has
+  time to enumerate.
+- **Drain log**: `power_off()` stores `battery_read_settled_mv()` (8
+  conversions discarded, 20 ms, 64 averaged; after the backlight is off) and
+  `gettimeofday()` in RTC memory with the reason. A wake from that sleep
+  shows sleep time, both voltages and mV/day in the banner (`last off`).
+  RTC clock: internal 136 kHz RC (no 32 kHz crystal on the board), a few %.
+- LED colours `0x2DFF00` / `0xFF9C00` hand-matched on hardware with ledcal.
+
 ## Mode-name overlay
 
 On a BOOT long press, and once at boot, the material name of the new look
@@ -1000,8 +1087,10 @@ liquid", "orange liquid".
 
 | Input | Action |
 |---|---|
-| BOOT short press (< `BTN_LONG_MS`) | respawn sand scattered in the top part of the screen |
-| BOOT long press (≥ `BTN_LONG_MS`, fires while held) | next sand-mode look: green gravel → orange gravel → green sand → orange sand → green liquid → orange liquid |
+| BOOT click (< `BTN_LONG_MS`, no second press within `BTN_DOUBLE_MS`) | respawn sand scattered in the top part of the screen |
+| BOOT double click | battery display for `BAT_OSD_MS`; prints the reading |
+| BOOT long press (released between `BTN_LONG_MS` and `BTN_HOLD_SHOW_MS`) | next sand-mode look: green gravel → orange gravel → green sand → orange sand → green liquid → orange liquid |
+| BOOT hold (`BTN_POWER_OFF_MS`) | power off (deep sleep); released while the `OFF` bar shows: cancelled |
 
 ## 9. Bring-up modes
 

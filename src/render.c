@@ -171,6 +171,267 @@ HOT_FN void render_frame(const uint8_t *snap, uint16_t *fb)
     }
 }
 
+HOT_FN void render_merge(const uint8_t *snap)
+{
+#if PERSISTENCE_ENABLE
+    const uint32_t keep = (uint32_t)(PERSISTENCE_KEEP * 256.0f);
+#else
+    const uint32_t keep = 0;
+#endif
+    // The glow update of render_frame() without drawing.
+    for (int i = 0; i < GRID_W * GRID_H; i++) {
+        uint32_t level = (((s_glow[i] & LEVEL_MASK) * keep) >> 8) & LEVEL_MASK;
+        uint32_t shade = s_glow[i] & SHADE_MASK;
+        uint32_t st = snap[i];
+        if (st) {
+            if ((st & LEVEL_MASK) > level) {
+                level = st & LEVEL_MASK;
+            }
+            shade = st & SHADE_MASK;
+        }
+        s_glow[i] = (uint8_t)(level | shade);
+    }
+}
+
+// ---- CRT power animation ------------------------------------------------------------
+
+static inline float clamp01(float v)
+{
+    return v < 0.0f ? 0.0f : v > 1.0f ? 1.0f : v;
+}
+
+void render_crt(uint16_t *fb, float open, float width, float k)
+{
+    memset(fb, 0, SCREEN_W * SCREEN_H * sizeof(uint16_t));
+    open = clamp01(open);
+    const int cy = SCREEN_H / 2;
+    if (open > 0.0f) {
+        // The picture squeezed into a band of height open * SCREEN_H around
+        // the middle. Squeezing concentrates the beam: the picture brightens
+        // and fills toward a solid line as the band closes.
+        const float closed = 1.0f - open;
+        const float gain = 1.0f + 1.5f * closed * closed;
+        const int floor_level = (int)(40.0f * closed * closed * closed);
+        int band = (int)(open * (float)SCREEN_H + 0.5f);
+        if (band < 2) {
+            band = 2;
+        }
+        const int top = cy - band / 2;
+        for (int y = top; y < top + band; y++) {
+            if (y < 0 || y >= SCREEN_H) {
+                continue;
+            }
+            int gy = (int)((float)(y - top) * (float)(GRID_H * GRAIN_PX) / (float)band) / GRAIN_PX;
+            gy = gy < 0 ? 0 : gy >= GRID_H ? GRID_H - 1 : gy;
+            const uint8_t *glow = &s_glow[gy * GRID_W];
+            uint16_t *out = &fb[y * SCREEN_W];
+            for (int gx = 0; gx < GRID_W; gx++) {
+                int level = (int)((float)(glow[gx] >> 2) * gain) + floor_level;
+                level = level > LUT_LEVELS - 1 ? LUT_LEVELS - 1 : level;
+                const uint16_t c = s_lut[glow[gx] & SHADE_MASK][level];
+                for (int p = 0; p < GRAIN_PX; p++) {
+                    *out++ = c;
+                }
+            }
+        }
+        return;
+    }
+    // The beam: a horizontal line `width` of the screen wide around the
+    // middle (a dot at 0) with a soft Gaussian edge, at intensity k. Its
+    // colour is the palette's brightest shade, running toward white where
+    // the beam is hottest.
+    k = clamp01(k);
+    const uint32_t c = palette_brightest(palette_get(s_palette));
+    const float base[3] = { (float)((c >> 16) & 0xFF), (float)((c >> 8) & 0xFF), (float)(c & 0xFF) };
+    const float half = 1.0f + clamp01(width) * (float)(SCREEN_W / 2 - 1);
+    const float cx = (float)SCREEN_W / 2.0f, mid = (float)cy - 0.5f;
+    const int reach = 7;
+    for (int y = cy - reach; y <= cy + reach; y++) {
+        const float dy = ((float)y - mid) / 1.6f;
+        const float vy = expf(-dy * dy);
+        for (int x = 0; x < SCREEN_W; x++) {
+            float d = fabsf((float)x + 0.5f - cx) - half;
+            d = d < 0.0f ? 0.0f : d / 2.5f;
+            const float i = k * vy * expf(-d * d);
+            if (i < 0.02f) {
+                continue;
+            }
+            const float hot = 0.75f * i;
+            int ch[3];
+            for (int j = 0; j < 3; j++) {
+                const float v = (base[j] + (255.0f - base[j]) * hot) * clamp01(1.3f * i);
+                ch[j] = (int)(v > 255.0f ? 255.0f : v);
+            }
+            fb[y * SCREEN_W + x] = rgb565(ch[0], ch[1], ch[2]);
+        }
+    }
+}
+
+bool render_crt_off_at(uint32_t ms, float *open, float *width, float *k)
+{
+    const float t = (float)ms;
+    *open = 0.0f;
+    *width = 0.0f;
+    *k = 1.0f;
+    if (t < CRT_OFF_SQUEEZE_MS) {
+        // Collapse accelerates, like a deflection field dying.
+        const float u = t / CRT_OFF_SQUEEZE_MS;
+        *open = 1.0f - u * sqrtf(u);
+        *width = 1.0f;
+    } else if (t < CRT_OFF_SQUEEZE_MS + CRT_OFF_SHRINK_MS) {
+        const float u = (t - CRT_OFF_SQUEEZE_MS) / CRT_OFF_SHRINK_MS;
+        *width = (1.0f - u) * (1.0f - u);
+    } else if (t < CRT_OFF_SQUEEZE_MS + CRT_OFF_SHRINK_MS + CRT_OFF_FADE_MS) {
+        const float u = (t - CRT_OFF_SQUEEZE_MS - CRT_OFF_SHRINK_MS) / CRT_OFF_FADE_MS;
+        *k = (1.0f - u) * (1.0f - u);
+    } else {
+        *k = 0.0f;
+        return false;
+    }
+    return true;
+}
+
+bool render_crt_on_at(uint32_t ms, float *open, float *width, float *k)
+{
+    const float t = (float)ms;
+    *open = 0.0f;
+    *width = 0.0f;
+    *k = 1.0f;
+    if (t < CRT_ON_DOT_MS) {
+        const float u = t / CRT_ON_DOT_MS;
+        *k = u * u;
+    } else if (t < CRT_ON_DOT_MS + CRT_ON_LINE_MS) {
+        const float u = (t - CRT_ON_DOT_MS) / CRT_ON_LINE_MS;
+        *width = 1.0f - (1.0f - u) * (1.0f - u);
+    } else if (t < CRT_ON_DOT_MS + CRT_ON_LINE_MS + CRT_ON_OPEN_MS) {
+        // Opens fast, then eases into the full picture.
+        const float u = (t - CRT_ON_DOT_MS - CRT_ON_LINE_MS) / CRT_ON_OPEN_MS;
+        *open = 1.0f - (1.0f - u) * (1.0f - u);
+        if (*open < 0.01f) {
+            *open = 0.01f;
+        }
+        *width = 1.0f;
+    } else {
+        *open = 1.0f;
+        *width = 1.0f;
+        return false;
+    }
+    return true;
+}
+
+void render_progress(uint16_t *fb, float frac, uint32_t rgb)
+{
+    frac = clamp01(frac);
+    const int w = SCREEN_W - 40, h = 10;
+    const int x0 = (SCREEN_W - w) / 2, y0 = SCREEN_H / 2 + 34;
+    const uint16_t c = render_color(rgb);
+    render_rect(fb, x0 - 3, y0 - 3, w + 6, h + 6, 0);
+    render_rect(fb, x0 - 2, y0 - 2, w + 4, 1, c);
+    render_rect(fb, x0 - 2, y0 + h + 1, w + 4, 1, c);
+    render_rect(fb, x0 - 2, y0 - 2, 1, h + 4, c);
+    render_rect(fb, x0 + w + 1, y0 - 2, 1, h + 4, c);
+    render_rect(fb, x0, y0, (int)((float)w * frac + 0.5f), h, c);
+}
+
+// Panel-order RGB565 -> 8-bit channels and back.
+static inline void unpack565(uint16_t c, int *r, int *g, int *b)
+{
+#if BOARD_LCD_SWAP_BYTES
+    c = (uint16_t)((c >> 8) | (c << 8));
+#endif
+    *r = ((c >> 11) & 0x1F) << 3;
+    *g = ((c >> 5) & 0x3F) << 2;
+    *b = (c & 0x1F) << 3;
+}
+
+// ---- Battery OSD --------------------------------------------------------------------
+
+#define BAT_BODY_W   64
+#define BAT_BODY_H   128
+#define BAT_WALL     3   // outline thickness
+#define BAT_INSET    4   // gap between the outline and the bars
+#define BAT_GAP      4   // gap between bars
+#define BAT_NUB_W    26
+#define BAT_NUB_H    8
+#define BAT_BOX_PAD  14  // black backing box around the icon
+
+// Add rgb * k (saturating) to a rectangle.
+static void add_rect(uint16_t *fb, int x, int y, int w, int h, const int rgb[3], float k)
+{
+    const int ar = (int)((float)rgb[0] * k), ag = (int)((float)rgb[1] * k), ab = (int)((float)rgb[2] * k);
+    for (int yy = y; yy < y + h; yy++) {
+        if (yy < 0 || yy >= SCREEN_H) {
+            continue;
+        }
+        for (int xx = x; xx < x + w; xx++) {
+            if (xx < 0 || xx >= SCREEN_W) {
+                continue;
+            }
+            uint16_t *p = &fb[yy * SCREEN_W + xx];
+            int r, g, b;
+            unpack565(*p, &r, &g, &b);
+            r += ar;
+            g += ag;
+            b += ab;
+            *p = rgb565(r > 255 ? 255 : r, g > 255 ? 255 : g, b > 255 ? 255 : b);
+        }
+    }
+}
+
+// A lit element with a faint 1-px phosphor halo around it.
+static void glow_rect(uint16_t *fb, int x, int y, int w, int h, const int rgb[3], float k)
+{
+    add_rect(fb, x - 1, y - 1, w + 2, 1, rgb, k * 0.3f);
+    add_rect(fb, x - 1, y + h, w + 2, 1, rgb, k * 0.3f);
+    add_rect(fb, x - 1, y, 1, h, rgb, k * 0.3f);
+    add_rect(fb, x + w, y, 1, h, rgb, k * 0.3f);
+    add_rect(fb, x, y, w, h, rgb, k);
+}
+
+void render_battery(uint16_t *fb, int bars, uint32_t rgb, float alpha)
+{
+    if (alpha <= 0.0f) {
+        return;
+    }
+    alpha = clamp01(alpha);
+    const int col[3] = { (int)((rgb >> 16) & 0xFF), (int)((rgb >> 8) & 0xFF), (int)(rgb & 0xFF) };
+    const int bx = (SCREEN_W - BAT_BODY_W) / 2, by = (SCREEN_H - BAT_BODY_H + BAT_NUB_H) / 2;
+
+    // Backing box: what is behind fades to black as the OSD appears.
+    const int x0 = bx - BAT_BOX_PAD, y0 = by - BAT_NUB_H - BAT_BOX_PAD;
+    const int x1 = bx + BAT_BODY_W + BAT_BOX_PAD, y1 = by + BAT_BODY_H + BAT_BOX_PAD;
+    const int keep = (int)((1.0f - alpha) * 256.0f);
+    for (int y = y0 < 0 ? 0 : y0; y < y1 && y < SCREEN_H; y++) {
+        for (int x = x0 < 0 ? 0 : x0; x < x1 && x < SCREEN_W; x++) {
+            uint16_t *p = &fb[y * SCREEN_W + x];
+            int r, g, b;
+            unpack565(*p, &r, &g, &b);
+            *p = rgb565((r * keep) >> 8, (g * keep) >> 8, (b * keep) >> 8);
+        }
+    }
+
+    // Outline and terminal nub.
+    glow_rect(fb, bx, by, BAT_BODY_W, BAT_WALL, col, alpha);
+    glow_rect(fb, bx, by + BAT_BODY_H - BAT_WALL, BAT_BODY_W, BAT_WALL, col, alpha);
+    glow_rect(fb, bx, by + BAT_WALL, BAT_WALL, BAT_BODY_H - 2 * BAT_WALL, col, alpha);
+    glow_rect(fb, bx + BAT_BODY_W - BAT_WALL, by + BAT_WALL, BAT_WALL, BAT_BODY_H - 2 * BAT_WALL, col, alpha);
+    glow_rect(fb, bx + (BAT_BODY_W - BAT_NUB_W) / 2, by - BAT_NUB_H, BAT_NUB_W, BAT_NUB_H, col, alpha);
+
+    // Five bars, bottom up; unlit ones are a faint trace of their slot.
+    const int ix = bx + BAT_WALL + BAT_INSET, iw = BAT_BODY_W - 2 * (BAT_WALL + BAT_INSET);
+    const int itop = by + BAT_WALL + BAT_INSET, ih = BAT_BODY_H - 2 * (BAT_WALL + BAT_INSET);
+    const int bh = (ih - 4 * BAT_GAP) / 5;
+    const int spare = ih - 5 * bh - 4 * BAT_GAP; // centre the stack
+    for (int i = 0; i < 5; i++) {
+        const int y = itop + spare / 2 + (4 - i) * (bh + BAT_GAP);
+        if (i < bars) {
+            glow_rect(fb, ix, y, iw, bh, col, alpha * 0.85f);
+        } else {
+            add_rect(fb, ix, y, iw, bh, col, alpha * 0.08f);
+        }
+    }
+}
+
 // ---- Text overlay -----------------------------------------------------------------
 
 // Classic 5x7 terminal font, A-Z. One byte per row, top row first; bit 4 is
@@ -204,16 +465,6 @@ static const uint8_t FONT_5X7[26][7] = {
     { 0x1F, 0x01, 0x02, 0x04, 0x08, 0x10, 0x1F }, // Z
 };
 
-// Panel-order RGB565 -> 8-bit channels and back.
-static inline void unpack565(uint16_t c, int *r, int *g, int *b)
-{
-#if BOARD_LCD_SWAP_BYTES
-    c = (uint16_t)((c >> 8) | (c << 8));
-#endif
-    *r = ((c >> 11) & 0x1F) << 3;
-    *g = ((c >> 5) & 0x3F) << 2;
-    *b = (c & 0x1F) << 3;
-}
 
 static int glyph_index(char ch)
 {

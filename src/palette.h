@@ -8,7 +8,7 @@
 typedef struct {
     const char *name;
     uint32_t shade[PALETTE_SHADES]; // 0xRRGGBB at full brightness; grains pick one at spawn
-    uint32_t led;                   // 0xRRGGBB for the onboard RGB LED
+    uint32_t led;                   // 0xRRGGBB for the onboard RGB LED (config.h LED_COLOR_*)
 } palette_t;
 
 // idx is taken modulo PALETTE_COUNT.

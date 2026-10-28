@@ -15,14 +15,17 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
+#include "battery.h"
 #include "button.h"
 #include "config.h"
 #include "display.h"
 #include "idle.h"
 #include "imu.h"
 #include "led.h"
+#include "ledcolor.h"
 #include "material.h"
 #include "palette.h"
+#include "power.h"
 #include "render.h"
 #include "sim.h"
 
@@ -44,6 +47,8 @@ static const char *TAG = "app";
 #define APP_MODE_NAME "tiltdot"
 #elif APP_MODE == MODE_SAND
 #define APP_MODE_NAME "sand"
+#elif APP_MODE == MODE_LED_CAL
+#define APP_MODE_NAME "ledcal"
 #endif
 
 #if APP_MODE == MODE_SAND
@@ -52,12 +57,60 @@ static const char *TAG = "app";
 #define SIM_TASK_CORE  0
 static char s_mem_info[160]; // where the sand memory went, for the banner
 static const char *s_mode_name = "";
+static bool s_mode_restored; // woke into the mode saved at power-off
 #endif
 
 // Init results, reported in the banner.
 static esp_err_t s_imu_err = ESP_ERR_NOT_FINISHED;
 static esp_err_t s_led_err = ESP_ERR_NOT_FINISHED;
 static esp_err_t s_btn_err = ESP_ERR_NOT_FINISHED;
+static esp_err_t s_bat_err = ESP_ERR_NOT_FINISHED;
+
+// "3.95 V, 70 %, 4 of 5 bars" / "4.21 V, on USB or charging" / an error.
+static void battery_text(char *buf, size_t n)
+{
+    batt_t b;
+    battery_get(&b);
+    if (s_bat_err != ESP_OK) {
+        snprintf(buf, n, "not available (%s)", esp_err_to_name(s_bat_err));
+    } else if (!b.valid) {
+        snprintf(buf, n, "no reading");
+    } else if (b.charging) {
+        snprintf(buf, n, "%.2f V, on USB or charging (level not meaningful)", (double)(b.mv / 1000.0f));
+    } else {
+        snprintf(buf, n, "%.2f V, %d %%, %d of 5 bars%s", (double)(b.mv / 1000.0f), b.percent, b.bars,
+                 b.low ? ", LOW" : "");
+    }
+}
+
+// Drain log: what happened since the last power-off, from the voltage then
+// and the settled reading at this boot.
+static void drain_text(char *buf, size_t n)
+{
+    static const char *const WHY[] = { "BOOT held", "auto-off", "battery cutoff" };
+    const power_last_off_t off = power_last_off();
+    const float now_mv = battery_boot_mv();
+    if (!off.valid) {
+        snprintf(buf, n, "none (not a wake from power-off)");
+        return;
+    }
+    const int h = (int)(off.slept_s / 3600.0), m = (int)(off.slept_s / 60.0) % 60;
+    if (off.mv_at_off <= 0.0f || now_mv <= 0.0f) {
+        snprintf(buf, n, "%s, slept %d h %02d min, no voltage reading", WHY[off.reason], h, m);
+        return;
+    }
+    const int len = snprintf(buf, n, "%s, slept %d h %02d min, %.3f V -> %.3f V, ", WHY[off.reason], h, m,
+                             (double)(off.mv_at_off / 1000.0f), (double)(now_mv / 1000.0f));
+    if (len < 0 || (size_t)len >= n) {
+        return;
+    }
+    if (off.slept_s < 3600.0) {
+        snprintf(buf + len, n - (size_t)len, "too short to estimate a drain (under 1 h)");
+    } else {
+        snprintf(buf + len, n - (size_t)len, "drain %.1f mV/day",
+                 (double)batt_drain_mv_per_day(off.mv_at_off, now_mv, off.slept_s));
+    }
+}
 
 static void print_banner(void)
 {
@@ -72,6 +125,7 @@ static void print_banner(void)
     printf(" build     : development (stats log %s)\n", STATS_LOG ? "on" : "off");
 #endif
     printf(" ESP-IDF   : %s\n", esp_get_idf_version());
+    printf(" started by: %s\n", power_boot_reason());
     printf(" display   : %dx%d @ %d MHz, offset (%d,%d), invert %d, BGR %d, swap bytes %d\n",
            SCREEN_W, SCREEN_H, BOARD_LCD_SPI_HZ / 1000000, BOARD_LCD_OFFSET_X, BOARD_LCD_OFFSET_Y,
            BOARD_LCD_INVERT, BOARD_LCD_BGR, BOARD_LCD_SWAP_BYTES);
@@ -83,9 +137,19 @@ static void print_banner(void)
         printf(" IMU       : not found (%s)\n", esp_err_to_name(s_imu_err));
     }
     printf(" RGB LED   : %s, button: %s\n", esp_err_to_name(s_led_err), esp_err_to_name(s_btn_err));
+    char bat[96];
+    battery_text(bat, sizeof(bat));
+    printf(" battery   : %s; ADC calibration %s\n", bat, battery_calibration());
+    char drain[160];
+    drain_text(drain, sizeof(drain));
+    printf(" last off  : %s\n", drain);
 #if APP_MODE == MODE_SAND
     printf(" sand      : %s\n", s_mem_info);
-    printf(" look      : %s (BOOT long press cycles the sand-mode table)\n", s_mode_name);
+    printf(" look      : %s%s (BOOT long press cycles the sand-mode table)\n", s_mode_name,
+           s_mode_restored ? ", restored after power-off" : "");
+    printf(" power     : hold BOOT %d s = off; auto-off after %d min idle%s; wake on BOOT, RESET%s\n",
+           BTN_POWER_OFF_MS / 1000, AUTO_OFF_S / 60, AUTO_OFF_ENABLE ? "" : " (disabled)",
+           WOM_ENABLE ? ", motion" : "");
     printf(" cores     : simulation on core %d, rendering on core %d\n", SIM_TASK_CORE, APP_TASK_CORE);
 #endif
     printf(" free heap : internal %u bytes, PSRAM %u bytes\n",
@@ -106,7 +170,7 @@ static void console_tick(void)
     was_connected = connected;
 }
 
-#if APP_MODE != MODE_TEST_PATTERN
+#if APP_MODE == MODE_TILT_DOT || APP_MODE == MODE_SAND
 static uint32_t now_ms(void)
 {
     return (uint32_t)(esp_timer_get_time() / 1000);
@@ -148,7 +212,7 @@ static void run_test_pattern(void)
     // Pure red on the LED checks its colour order too.
     uint32_t seconds = 0;
     for (int tick = 0;; tick++) {
-        led_update(0xFF0000, 0.5f, (uint32_t)(esp_timer_get_time() / 1000));
+        led_update(0xFF0000, 0.5f, 1.0f, (uint32_t)(esp_timer_get_time() / 1000));
         if (tick % 20 == 0) {
             console_tick();
             printf("[testpattern] alive, uptime %" PRIu32 " s\n", seconds++);
@@ -209,7 +273,7 @@ static void run_tilt_dot(void)
         render_rect(fb, SCREEN_W - 1, 0, 1, SCREEN_H, edge);
         render_rect(fb, (int)x - r, (int)y - r, 2 * r + 1, 2 * r + 1, dot);
         display_push_async();
-        led_update(pal->led, sp / 8.0f, now_ms());
+        led_update(pal->led, sp / 8.0f, 1.0f, now_ms());
 
         uint32_t t = now_ms();
         if (t - last_log >= 100) {
@@ -336,11 +400,19 @@ static esp_err_t sand_init(void)
         ESP_LOGW(TAG, "simulation memory is in PSRAM; expect much slower steps");
     }
 
+    // A wake from power-off resumes the saved mode; anything else starts in
+    // the first. The sand always respawns.
+    int mode = power_saved_mode();
+    s_mode_restored = mode >= 0 && mode < MODE_COUNT;
+    if (!s_mode_restored) {
+        mode = 0;
+    }
+    s_mode_req = mode;
     sim_init(&s_sim, mem, GRID_W, GRID_H, n, esp_random());
-    sim_set_material(&s_sim, material_get(MODES[0].material));
+    sim_set_material(&s_sim, material_get(MODES[mode].material));
     sim_spawn(&s_sim, SPAWN_REGION_FRACTION, PALETTE_SHADES);
-    render_init(MODES[0].palette);
-    apply_look(0);
+    render_init(MODES[mode].palette);
+    apply_look(mode);
     return ESP_OK;
 }
 
@@ -349,7 +421,7 @@ static void sim_task(void *arg)
     (void)arg;
     int64_t last = esp_timer_get_time();
     int64_t acc_us = 0;
-    int mode = 0;
+    int mode = __atomic_load_n(&s_mode_req, __ATOMIC_ACQUIRE);
     idle_t idle;
     idle_init(&idle, last);
 
@@ -451,21 +523,131 @@ static void sim_task(void *arg)
     }
 }
 
+// Take the newest snapshot, if there is one, and tell the sim when this
+// frame took it (it times its next publish for the next frame).
+static bool take_snapshot(void)
+{
+    int64_t take_us = esp_timer_get_time();
+    portENTER_CRITICAL(&s_snap_lock);
+    s_snap.last_take_us = take_us;
+    bool got = s_snap.fresh;
+    if (got) {
+        int t = s_snap.front;
+        s_snap.front = s_snap.ready;
+        s_snap.ready = t;
+        s_snap.fresh = false;
+    }
+    portEXIT_CRITICAL(&s_snap_lock);
+    return got;
+}
+
+// CRT warm-up: a dot, a line, then the picture opens. The simulation already
+// runs, so the freshly spawned sand is falling as the screen opens.
+static void play_power_on(uint16_t *fb)
+{
+    const int64_t t0 = esp_timer_get_time();
+    int64_t next = t0;
+    for (;;) {
+        const int64_t now = esp_timer_get_time();
+        float open, width, k;
+        const bool more = render_crt_on_at((uint32_t)((now - t0) / 1000), &open, &width, &k);
+        if (!more) {
+            return;
+        }
+        take_snapshot();
+        display_wait();
+        render_merge(s_snap.buf[s_snap.front]);
+        render_crt(fb, open, width, k);
+        display_push_async();
+        led_update(palette_get(render_palette())->led, 0.0f, open > 0.0f ? 1.0f : k, now_ms());
+        pace_frame(&next);
+    }
+}
+
+// CRT collapse from the picture on screen, the LED fading with the dot.
+static void play_power_off(uint16_t *fb)
+{
+    const int64_t t0 = esp_timer_get_time();
+    int64_t next = t0;
+    for (;;) {
+        const int64_t now = esp_timer_get_time();
+        float open, width, k;
+        const bool more = render_crt_off_at((uint32_t)((now - t0) / 1000), &open, &width, &k);
+        display_wait();
+        render_crt(fb, open, width, k);
+        display_push_async();
+        led_update(palette_get(render_palette())->led, 0.0f, open > 0.0f ? 1.0f : k, now_ms());
+        if (!more) {
+            display_wait();
+            return;
+        }
+        pace_frame(&next);
+    }
+}
+
+// Plausibly on USB: the reading looks like the charger, or a USB host is
+// talking to the serial port. The cutoff is not applied then.
+static bool on_usb(const batt_t *b)
+{
+    return b->charging || usb_serial_jtag_is_connected();
+}
+
+// Low-voltage warning: the empty battery icon blinking (with the LED blinking
+// red) for BAT_CUTOFF_WARN_MS, over the running sand or over black.
+static void play_cutoff_warning(uint16_t *fb, bool with_sand)
+{
+    const uint32_t c = palette_brightest(palette_get(render_palette()));
+    const int64_t t0 = esp_timer_get_time();
+    int64_t next = t0;
+    for (;;) {
+        const int64_t ms = (esp_timer_get_time() - t0) / 1000;
+        if (ms >= BAT_CUTOFF_WARN_MS) {
+            return;
+        }
+        const bool on = ms % BAT_CUTOFF_BLINK_MS < BAT_CUTOFF_BLINK_MS / 2;
+        if (with_sand) {
+            take_snapshot();
+        }
+        display_wait();
+        if (with_sand) {
+            render_frame(s_snap.buf[s_snap.front], fb);
+        } else {
+            render_fill(fb, 0);
+        }
+        render_battery(fb, 0, c, on ? 1.0f : 0.25f);
+        display_push_async();
+        led_show(BAT_LOW_COLOR, on ? LED_MAX_LEVEL : 0);
+        pace_frame(&next);
+    }
+}
+
+// Boot check: below the cutoff (a settled reading taken before the backlight
+// came on), warn and go back to sleep without starting the sand.
+static void boot_cutoff_check(uint16_t *fb)
+{
+    const float mv = battery_boot_mv();
+    if (mv <= 0.0f || !batt_below_cutoff(mv, power_after_cutoff())) {
+        return;
+    }
+    batt_t b;
+    battery_get(&b);
+    printf("battery %.3f V is below the cutoff (%.3f V%s)\n", (double)(mv / 1000.0f),
+           (double)((float)(BAT_CUTOFF_MV + (power_after_cutoff() ? BAT_CUTOFF_RESUME_MV : 0)) / 1000.0f),
+           power_after_cutoff() ? " to resume after a cutoff" : "");
+    play_cutoff_warning(fb, false);
+    // Checked after the warning: a USB host needs a moment to enumerate.
+    if (on_usb(&b)) {
+        printf("on USB: cutoff not applied\n");
+        return;
+    }
+    play_power_off(fb);
+    power_off(__atomic_load_n(&s_mode_req, __ATOMIC_ACQUIRE), s_imu_err == ESP_OK, POWER_OFF_CUTOFF);
+}
+
 static void run_sand(void)
 {
     uint16_t *fb = display_framebuffer();
-    int64_t next = esp_timer_get_time();
-    int64_t stat_t0 = next;
-    int frames = 0, new_frames = 0;
-    int64_t render_us = 0, wait_us = 0;
-
-    // Mode-name overlay: shown at boot and after every look change.
-    int64_t overlay_t0 = esp_timer_get_time();
-    int overlay_mode = 0;
-
-    // Idle dimming: the button counts as activity too.
-    int64_t button_us = overlay_t0;
-    int backlight = BACKLIGHT_PERCENT;
+    boot_cutoff_check(fb);
 
 #if STATS_LOG
     // A release build logs warnings only; the statistics line is info.
@@ -475,18 +657,49 @@ static void run_sand(void)
 #endif
 
     xTaskCreatePinnedToCore(sim_task, "sim", SIM_TASK_STACK, NULL, SIM_TASK_PRIO, NULL, SIM_TASK_CORE);
+    play_power_on(fb);
+
+    int64_t next = esp_timer_get_time();
+    int64_t stat_t0 = next;
+    int frames = 0, new_frames = 0;
+    int64_t render_us = 0, wait_us = 0;
+
+    // Mode-name overlay: shown after the power-on animation and after every
+    // look change.
+    int64_t overlay_t0 = esp_timer_get_time();
+    int overlay_mode = __atomic_load_n(&s_mode_req, __ATOMIC_ACQUIRE);
+
+    // Battery OSD (double click): start time, -1 = not shown.
+    int64_t osd_t0 = -1;
+    power_off_reason_t off_reason = POWER_OFF_BUTTON;
+
+    // Idle dimming: the button counts as activity too.
+    int64_t button_us = overlay_t0;
+    int backlight = BACKLIGHT_PERCENT;
 
     for (;;) {
         uint32_t ev = button_take_events();
-        if (ev) {
+        const float hold = button_hold_progress();
+        if (ev || hold >= 0.0f) {
             button_us = esp_timer_get_time();
         }
-        if (ev & BUTTON_EVT_SHORT) {
+        if (ev & GESTURE_POWER_OFF) {
+            ESP_LOGI(TAG, "power off (BOOT held)");
+            off_reason = POWER_OFF_BUTTON;
+            break;
+        }
+        if (ev & GESTURE_CLICK) {
             __atomic_store_n(&s_respawn_req, true, __ATOMIC_RELEASE);
             render_clear();
             ESP_LOGI(TAG, "respawn");
         }
-        if (ev & BUTTON_EVT_LONG) {
+        if (ev & GESTURE_DOUBLE) {
+            osd_t0 = esp_timer_get_time();
+            char bat[96];
+            battery_text(bat, sizeof(bat));
+            printf("battery: %s\n", bat);
+        }
+        if (ev & GESTURE_LONG) {
             int mode = (__atomic_load_n(&s_mode_req, __ATOMIC_ACQUIRE) + 1) % MODE_COUNT;
             apply_look(mode);
             __atomic_store_n(&s_mode_req, mode, __ATOMIC_RELEASE);
@@ -496,20 +709,7 @@ static void run_sand(void)
             overlay_mode = mode;
         }
 
-        // Take the newest snapshot, if there is one, and tell the sim when
-        // this frame took it (it times its next publish for the next frame).
-        int64_t take_us = esp_timer_get_time();
-        portENTER_CRITICAL(&s_snap_lock);
-        s_snap.last_take_us = take_us;
-        bool got = s_snap.fresh;
-        if (got) {
-            int t = s_snap.front;
-            s_snap.front = s_snap.ready;
-            s_snap.ready = t;
-            s_snap.fresh = false;
-        }
-        portEXIT_CRITICAL(&s_snap_lock);
-        new_frames += got;
+        new_frames += take_snapshot();
 
         int64_t t0 = esp_timer_get_time();
         display_wait();
@@ -523,6 +723,29 @@ static void run_sand(void)
             const sand_mode_t *md = &MODES[overlay_mode];
             render_overlay(fb, material_get(md->material)->name, palette_brightest(palette_get(md->palette)),
                            alpha);
+        }
+        batt_t bat;
+        battery_get(&bat);
+        if (osd_t0 >= 0) {
+            const int64_t osd_ms = (t1 - osd_t0) / 1000;
+            if (osd_ms >= BAT_OSD_MS) {
+                osd_t0 = -1;
+            } else {
+                const float alpha = osd_ms < BAT_OSD_MS - BAT_OSD_FADE_MS
+                                        ? 1.0f
+                                        : (float)(BAT_OSD_MS - osd_ms) / (float)BAT_OSD_FADE_MS;
+                // On USB / charging the level means nothing: the bars climb.
+                const int bars = bat.charging ? (int)((osd_ms / BAT_OSD_CHARGE_STEP_MS) % 6)
+                                 : bat.valid  ? bat.bars
+                                              : 0;
+                render_battery(fb, bars, palette_brightest(palette_get(render_palette())), alpha);
+            }
+        }
+        if (hold >= 0.0f) {
+            // Past the long press: keep holding to power off, let go to cancel.
+            const uint32_t c = palette_brightest(palette_get(render_palette()));
+            render_overlay(fb, "OFF", c, 1.0f);
+            render_progress(fb, hold, c);
         }
         display_push_async();
         int64_t t2 = esp_timer_get_time();
@@ -540,13 +763,27 @@ static void run_sand(void)
             backlight = want_bl;
             display_set_backlight(backlight);
         }
-        uint32_t led = palette_get(render_palette())->led;
-        if (dim > 0.0f) {
-            const float k = 1.0f - (1.0f - IDLE_DIM_LED_SCALE) * dim;
-            led = ((uint32_t)((float)((led >> 16) & 0xFF) * k) << 16) | ((uint32_t)((float)((led >> 8) & 0xFF) * k) << 8) |
-                  (uint32_t)((float)(led & 0xFF) * k);
+        // The LED dims by brightness, not by scaling its (gamma-encoded) colour.
+        const float led_k = 1.0f - (1.0f - IDLE_DIM_LED_SCALE) * dim;
+        if (bat.low) {
+            // Low battery: a short red blink instead of the palette pulse.
+            const bool on = now_ms() % BAT_LOW_BLINK_MS < BAT_LOW_BLINK_ON_MS;
+            led_show(BAT_LOW_COLOR, on ? (int)lroundf((float)LED_MAX_LEVEL * led_k) : 0);
+        } else {
+            led_update(palette_get(render_palette())->led, motion / LED_MOTION_FULL, led_k, now_ms());
         }
-        led_update(led, motion / LED_MOTION_FULL, now_ms());
+        if (idle_auto_off(t2 - active_us)) {
+            ESP_LOGI(TAG, "auto-off after %d s without activity", AUTO_OFF_S);
+            off_reason = POWER_OFF_AUTO;
+            break;
+        }
+        // Low-voltage cutoff, on the filtered reading once it has settled.
+        if (bat.valid && bat.n >= 10 && batt_below_cutoff(bat.mv, false) && !on_usb(&bat)) {
+            printf("battery %.3f V below the cutoff %.3f V: powering off\n", (double)(bat.mv / 1000.0f),
+                   (double)BAT_CUTOFF_MV / 1000.0);
+            off_reason = POWER_OFF_CUTOFF;
+            break;
+        }
 
         frames++;
         wait_us += t1 - t0;
@@ -561,11 +798,12 @@ static void run_sand(void)
             float secs = (float)(t2 - stat_t0) / 1e6f;
             ESP_LOGI(TAG, "fps %.1f (%d new) | sim %.0f steps/s, %" PRId64 " us/step (max %" PRId64
                      "), %d awake | snapshot %" PRId64 " us | render %" PRId64 " us | dma wait %" PRId64
-                     " us | motion %.0f%s%s",
+                     " us | motion %.0f | bat %.0f mV %d %%%s%s%s",
                      (double)((float)frames / secs), new_frames, (double)((float)st.steps / secs),
                      st.steps ? st.step_us / st.steps : 0, st.max_step_us, st.awake,
                      st.snaps ? st.snap_us / st.snaps : 0, render_us / frames, wait_us / frames,
-                     (double)st.motion, st.lost_us ? " | SIM BEHIND REAL TIME" : "", dim > 0.0f ? " | dimmed" : "");
+                     (double)st.motion, (double)bat.mv, bat.percent, bat.charging ? " (USB)" : bat.low ? " LOW" : "",
+                     st.lost_us ? " | SIM BEHIND REAL TIME" : "", dim > 0.0f ? " | dimmed" : "");
 #endif
             if (st.lost_us) {
                 ESP_LOGW(TAG, "simulation lost %" PRId64 " ms of real time in the last second", st.lost_us / 1000);
@@ -577,6 +815,118 @@ static void run_sand(void)
         }
 
         pace_frame(&next);
+    }
+
+    // Power off. Idle dimming may have the backlight low; the collapse plays
+    // at the brightness it is.
+    if (off_reason == POWER_OFF_CUTOFF) {
+        play_cutoff_warning(fb, true);
+    }
+    play_power_off(fb);
+    power_off(__atomic_load_n(&s_mode_req, __ATOMIC_ACQUIRE), s_imu_err == ESP_OK, off_reason);
+}
+#endif
+
+// ---- MODE_LED_CAL --------------------------------------------------------------------
+//
+// The screen shows the palette's main colour; the LED shows a candidate for
+// the palette's LED colour. Candidates step through hue and saturation around
+// LED_COLOR_* (gamma-encoded HSV, the same space as the config value). Click:
+// next candidate, double click: previous, long press: next palette. Every
+// change prints the value to copy into config.h.
+
+#if APP_MODE == MODE_LED_CAL
+#define CAL_HUES  (2 * LEDCAL_HUE_STEPS + 1)
+#define CAL_COUNT (CAL_HUES * (LEDCAL_SAT_STEPS + 1))
+
+static uint32_t cal_candidate(const palette_t *pal, int idx, float *dh, float *sat)
+{
+    float h, s, v;
+    ledcolor_to_hsv(pal->led, &h, &s, &v);
+    *dh = (float)(idx % CAL_HUES - LEDCAL_HUE_STEPS) * LEDCAL_HUE_STEP_DEG;
+    *sat = fmaxf(0.0f, s - (float)(idx / CAL_HUES) * LEDCAL_SAT_STEP);
+    return ledcolor_from_hsv(h + *dh, *sat, v);
+}
+
+// Channel check: pure red, green and blue for a second each on the LED and
+// the screen together. If the LED shows a different colour than the screen,
+// BOARD_RGB_ORDER_RGB in board.h is wrong.
+static void led_channel_check(uint16_t *fb)
+{
+    static const struct {
+        const char *name;
+        uint32_t rgb;
+    } CH[] = { { "RED", 0xFF0000 }, { "GREEN", 0x00FF00 }, { "BLUE", 0x0000FF } };
+    printf("ledcal: channel check, LED byte order %s: the LED must match the screen\n",
+           BOARD_RGB_ORDER_RGB ? "RGB" : "GRB");
+    for (size_t i = 0; i < sizeof(CH) / sizeof(CH[0]); i++) {
+        printf("ledcal: channel check %s (screen and LED 0x%06" PRIX32 ")\n", CH[i].name, CH[i].rgb);
+        led_show(CH[i].rgb, LEDCAL_LEVEL);
+        display_wait();
+        render_fill(fb, render_color(CH[i].rgb));
+        render_overlay(fb, CH[i].name, 0xFFFFFF, 1.0f); // name in white on a black box
+        display_push_async();
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+    printf("ledcal: channel check done. If any colour differed, flip BOARD_RGB_ORDER_RGB in src/board.h.\n");
+}
+
+static void run_led_cal(void)
+{
+    uint16_t *fb = display_framebuffer();
+    led_channel_check(fb);
+    button_take_events(); // presses during the check do not count
+    int pal_idx = 0;
+    int idx = LEDCAL_HUE_STEPS; // the configured value: no hue offset, full saturation
+    bool changed = true;
+    int64_t label_t0 = esp_timer_get_time();
+
+    printf("\nledcal: the screen shows the palette's main colour, the LED a candidate LED colour.\n");
+    printf("ledcal: click = next candidate, double click = previous, long press = next palette.\n");
+    printf("ledcal: %d candidates per palette: hue %+.0f..%+.0f deg in %.0f deg steps, saturation down to -%.1f.\n",
+           CAL_COUNT, (double)(-LEDCAL_HUE_STEPS * LEDCAL_HUE_STEP_DEG), (double)(LEDCAL_HUE_STEPS * LEDCAL_HUE_STEP_DEG),
+           (double)LEDCAL_HUE_STEP_DEG, (double)(LEDCAL_SAT_STEPS * LEDCAL_SAT_STEP));
+    for (;;) {
+        const uint32_t ev = button_take_events();
+        if (ev & GESTURE_CLICK) {
+            idx = (idx + 1) % CAL_COUNT;
+            changed = true;
+        }
+        if (ev & GESTURE_DOUBLE) {
+            idx = (idx + CAL_COUNT - 1) % CAL_COUNT;
+            changed = true;
+        }
+        if (ev & GESTURE_LONG) {
+            pal_idx = (pal_idx + 1) % PALETTE_COUNT;
+            idx = LEDCAL_HUE_STEPS;
+            changed = true;
+            label_t0 = esp_timer_get_time();
+        }
+        const palette_t *pal = palette_get(pal_idx);
+        float dh, sat;
+        const uint32_t cand = cal_candidate(pal, idx, &dh, &sat);
+        if (changed) {
+            changed = false;
+            led_show(cand, LEDCAL_LEVEL);
+            const uint32_t sent = led_linear(cand, LEDCAL_LEVEL);
+            printf("ledcal %s: candidate %d/%d, hue %+.0f deg, saturation %.2f -> "
+                   "#define LED_COLOR_%s 0x%06" PRIX32 "   (configured 0x%06" PRIX32 "; LED gets R%" PRIu32
+                   " G%" PRIu32 " B%" PRIu32 " at level %d)\n",
+                   pal->name, idx + 1, CAL_COUNT, (double)dh, (double)sat, pal_idx == PALETTE_GREEN ? "GREEN" : "ORANGE",
+                   cand, pal->led, (sent >> 16) & 0xFF, (sent >> 8) & 0xFF, sent & 0xFF, LEDCAL_LEVEL);
+        }
+        display_wait();
+        render_fill(fb, render_color(pal->shade[0]));
+        const int64_t shown_ms = (esp_timer_get_time() - label_t0) / 1000;
+        if (shown_ms < OVERLAY_HOLD_MS + OVERLAY_FADE_MS) {
+            const float alpha = shown_ms < OVERLAY_HOLD_MS
+                                    ? 1.0f
+                                    : 1.0f - (float)(shown_ms - OVERLAY_HOLD_MS) / (float)OVERLAY_FADE_MS;
+            render_overlay(fb, pal->name, pal->shade[0], alpha);
+        }
+        display_push_async();
+        console_tick();
+        vTaskDelay(pdMS_TO_TICKS(20));
     }
 }
 #endif
@@ -592,20 +942,34 @@ static void app_task(void *arg)
     run_tilt_dot();
 #elif APP_MODE == MODE_SAND
     run_sand();
+#elif APP_MODE == MODE_LED_CAL
+    run_led_cal();
 #else
-#error "APP_MODE must be MODE_TEST_PATTERN, MODE_TILT_DOT or MODE_SAND"
+#error "APP_MODE must be MODE_TEST_PATTERN, MODE_TILT_DOT, MODE_SAND or MODE_LED_CAL"
 #endif
     vTaskDelete(NULL);
 }
 
 void app_main(void)
 {
+    power_init();
+    if (power_is_arm_wake()) {
+        // The brief timer wake after power-off: arm motion wake, sleep again.
+        power_arm_wake();
+    }
     ESP_LOGI(TAG, "starting, mode %s", APP_MODE_NAME);
     // LED first: a WS2812 keeps whatever it last latched (from a previous
     // firmware or noise on a floating line) until it is told otherwise.
     s_led_err = led_init();
     if (s_led_err != ESP_OK) {
         ESP_LOGE(TAG, "RGB LED init failed");
+    }
+    // Battery before the backlight: its first, settled reading (boot cutoff
+    // check, drain log) is taken with the cell as lightly loaded as at
+    // power-off.
+    s_bat_err = battery_init();
+    if (s_bat_err != ESP_OK) {
+        ESP_LOGE(TAG, "battery ADC init failed");
     }
 
     ESP_ERROR_CHECK(display_init());

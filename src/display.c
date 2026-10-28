@@ -15,6 +15,7 @@
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
+#include "freertos/task.h"
 
 #include "config.h"
 
@@ -105,8 +106,25 @@ void display_set_backlight(int percent)
     ledc_update_duty(LEDC_LOW_SPEED_MODE, BL_LEDC_CHANNEL);
 }
 
+// Pins held at fixed levels through deep sleep (display_sleep()).
+static const struct {
+    int pin;
+    int level;
+} SLEEP_PINS[] = {
+    { BOARD_LCD_PIN_CS, 1 },   // deselected: the panel ignores the bus
+    { BOARD_LCD_PIN_RST, 1 },  // no reset (it would leave sleep-in anyway, but keep it quiet)
+    { BOARD_LCD_PIN_DC, 0 },
+    { BOARD_LCD_PIN_SCLK, 0 },
+    { BOARD_LCD_PIN_MOSI, 0 },
+    { BOARD_LCD_PIN_BL, 0 },   // backlight FET off (it also has a gate pull-down)
+};
+
 esp_err_t display_init(void)
 {
+    // Coming out of deep sleep the pins are still held; release them.
+    for (size_t i = 0; i < sizeof(SLEEP_PINS) / sizeof(SLEEP_PINS[0]); i++) {
+        gpio_hold_dis(SLEEP_PINS[i].pin);
+    }
     // Backlight off until the first frame is on the panel.
     ESP_RETURN_ON_ERROR(backlight_init(), TAG, "backlight");
 
@@ -187,4 +205,30 @@ void display_wait(void)
         ESP_LOGW(TAG, "frame push timed out");
     }
     s_busy = false;
+}
+
+void display_sleep(void)
+{
+    display_wait();
+    display_set_backlight(0);
+    // DISPOFF, then SLPIN: the controller stops scanning and its booster and
+    // oscillator turn off. 5 ms before the next command (ST7789 datasheet);
+    // the bus is then quiet until the next boot resets the panel.
+    esp_lcd_panel_disp_on_off(s_panel, false);
+    esp_lcd_panel_disp_sleep(s_panel, true);
+    vTaskDelay(pdMS_TO_TICKS(10));
+    ledc_stop(LEDC_LOW_SPEED_MODE, BL_LEDC_CHANNEL, 0);
+    display_hold_pins();
+}
+
+void display_hold_pins(void)
+{
+    for (size_t i = 0; i < sizeof(SLEEP_PINS) / sizeof(SLEEP_PINS[0]); i++) {
+        const int pin = SLEEP_PINS[i].pin;
+        gpio_reset_pin(pin);
+        gpio_set_pull_mode(pin, GPIO_FLOATING);
+        gpio_set_direction(pin, GPIO_MODE_OUTPUT);
+        gpio_set_level(pin, SLEEP_PINS[i].level);
+        gpio_hold_en(pin);
+    }
 }

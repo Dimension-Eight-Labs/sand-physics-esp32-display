@@ -21,3 +21,12 @@ void display_wait(void);
 
 // 0..100 %.
 void display_set_backlight(int percent);
+
+// Before deep sleep: backlight off, controller to display-off + sleep-in mode,
+// bus and control pins held at quiet levels through the sleep. The next
+// display_init() releases them and resets the panel.
+void display_sleep(void);
+
+// Just the pin part of display_sleep() (again after a brief wake that did not
+// start the display).
+void display_hold_pins(void);

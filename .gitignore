@@ -9,3 +9,5 @@ sdkconfig.*
 build-host/
 # Release images written by scripts/make_release.sh
 dist/
+# Editor settings
+.vscode/
